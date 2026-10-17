@@ -1,9 +1,9 @@
 {
   "features": {
-    "radius-api": false,
-    "inventory": false,
-    "update-status": false,
-    "papercut": false,
-    "extending-pi": false
+    "radius-api": true,
+    "inventory": true,
+    "update-status": true,
+    "papercut": true,
+    "extending-pi": true
   }
 }
