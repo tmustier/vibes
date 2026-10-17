@@ -20,7 +20,16 @@ const status = (overrides) => ({
 });
 
 assert.equal(updateWarning(status(), now), undefined);
-assert.match(updateWarning(undefined, now), /aren't set up/);
+assert.match(updateWarning(undefined, now), /No Vibes update has been recorded/);
+const home = status({ updater: "home", log: "~/Library/Logs/pi-personal-update.log" });
+const homeOverdue = updateWarning({ ...home, finishedAt: new Date(now - 4 * day).toISOString() }, now);
+assert.match(homeOverdue, /vibes update/);
+assert.match(homeOverdue, /vibes status/);
+assert.doesNotMatch(homeOverdue, /vibes refresh|catches up after login/);
+const homeFailure = { ...home, steps: [{ name: "packages", ok: false, detail: "exit 1" }] };
+assert.match(fixRequest(homeFailure, "/s/1.jsonl"), /personal Vibes update/);
+assert.match(fixRequest(homeFailure, "/s/1.jsonl"), /Then run `vibes update`/);
+assert.doesNotMatch(fixRequest(homeFailure, "/s/1.jsonl"), /vibes report|maintainers/);
 assert.match(
   updateWarning(status({ ok: false, steps: [{ name: "homebrew", ok: true, detail: "" }, { name: "pi", ok: false, detail: "exit 1" }] }), now),
   /failed: pi\./,
@@ -162,6 +171,17 @@ assert.equal(run.sent.length, 0);
 writeFileSync(path.join(agent, "vibes-update.json"), JSON.stringify(status({ agentsTemplateHash: hash, finishedAt: new Date().toISOString() })));
 run = await start(false);
 assert.deepEqual(run.sent.map((s) => s.message.customType), ["vibes-agents-changed"]);
+// Home updates do not propose replacing personal instructions, even with a legacy template hash.
+writeFileSync(path.join(agent, "vibes-update.json"), JSON.stringify({ ...home, finishedAt: new Date().toISOString(), agentsTemplateHash: hash }));
+writeFileSync(path.join(agent, "vibes-agents-reviewed"), "old hash\n");
+assert.deepEqual((await start(false)).sent, []);
+const homeCli = execFileSync("bash", ["scripts/home-vibes", "status"], { encoding: "utf8" });
+assert.match(homeCli, /Last update:.*succeeded/);
+assert.match(homeCli, /pi-personal-update\.log/);
+writeFileSync(path.join(agent, "vibes-update.json"), JSON.stringify({ ...homeFailure, finishedAt: new Date().toISOString() }));
+const homeRepair = await start(false);
+assert.equal(homeRepair.sent[0].message.customType, "vibes-update-failed");
+assert.doesNotMatch(homeRepair.sent[0].message.content, /vibes report|maintainers/);
 // A real kernel lock suppresses stale warnings/repair turns during login catch-up. A crash
 // releases it automatically; a leftover file alone must not suppress anything.
 assert.equal(updateIsRunning(), false);

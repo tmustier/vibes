@@ -2,26 +2,106 @@
 # Update this distribution without merging another repository or pushing local changes.
 set -euo pipefail
 repo="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+# Parse the update before Git can replace this file during its own run.
+home_update_main() {
+# Share the kernel lock and status schema with the startup status extension.
+source "$repo/scripts/vibes"
+LOG_FILE="$HOME/Library/Logs/pi-personal-update.log"
 export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 export NVM_DIR="$HOME/.nvm"
-. "$NVM_DIR/nvm.sh" --no-use
-nvm use --silent default >/dev/null
-log="$HOME/Library/Logs/pi-personal-update.log"
-mkdir -p "$(dirname "$log")"
-exec >>"$log" 2>&1
-printf '\n=== %s personal Vibes update ===\n' "$(date)"
-[ -z "$(git -C "$repo" status --porcelain)" ] || { echo 'Local Vibes checkout is dirty; update skipped.'; exit 1; }
-previous="$(mktemp -d)"
-trap 'rm -rf "$previous"' EXIT
-cp "$repo/settings.template.json" "$repo/subagent-config.template.json" "$repo/web-search.template.json" "$previous/"
-[ ! -f "$repo/models.template.json" ] || cp "$repo/models.template.json" "$previous/"
-git -C "$repo" fetch --quiet origin main
-git -C "$repo" merge --ff-only origin/main
-(cd "$repo" && npm ci --omit=dev --ignore-scripts && npm install --no-save --omit=dev codex-computer-use-mcp@latest @tmustier/pi-session-hud@latest)
-node "$repo/scripts/sync-settings.mjs" "$previous" "$repo" "$HOME/.pi/agent"
-pinned="$(node -p "require('$repo/package.json').devDependencies['@earendil-works/pi-coding-agent']")"
-cutoff="$(node -p "require('$repo/package.json').piDependencyCutoff")"
-[ "$(pi --version)" = "$pinned" ] || npm install -g --ignore-scripts --before "$cutoff" "@earendil-works/pi-coding-agent@$pinned"
-"$repo/scripts/vibes" check
-[ -z "$(git -C "$repo" status --porcelain)" ] || { echo 'Update left a dirty checkout.'; exit 1; }
+mkdir -p "$AGENT_DIR"
+if [ -z "${VIBES_UPDATE_LOCKED:-}" ]; then
+  export VIBES_UPDATE_LOCKED=1
+  with_lock "$repo/scripts/home-update"
+fi
+previous=""
+current_step="logging"
+finish() {
+  local result=$1
+  trap - EXIT
+  set +e
+  [ -z "$previous" ] || rm -rf "$previous"
+  if [ "$result" -ne 0 ]; then record "${current_step:-update}" fail "exit $result"; fi
+  python3 - "$STATUS_FILE" "$LOG_FILE" "$result" ${RESULTS[@]+"${RESULTS[@]}"} <<'PY'
+from datetime import datetime, timezone
+import json
+import os
+from pathlib import Path
+import sys
+import tempfile
+
+file, log, result, *rows = sys.argv[1:]
+steps = []
+for row in rows:
+    name, state, detail = row.split("\t", 2)
+    steps.append({"name": name, "ok": state == "ok", "detail": detail})
+status = {"updater": "home", "finishedAt": datetime.now(timezone.utc).isoformat(),
+          "ok": result == "0", "log": log, "steps": steps}
+path = Path(file)
+fd, temporary = tempfile.mkstemp(prefix=path.name + ".", dir=path.parent)
+try:
+    with os.fdopen(fd, "w") as output:
+        output.write(json.dumps(status, indent=2) + "\n")
+    os.replace(temporary, path)
+finally:
+    if os.path.exists(temporary):
+        os.unlink(temporary)
+PY
+  local saved=$?
+  if [ "$saved" -ne 0 ]; then
+    echo 'Could not save the home update result.' >&2
+    [ "$result" -ne 0 ] || result=$saved
+  fi
+  exit "$result"
+}
+trap 'finish "$?"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+run_step() {
+  current_step=$1
+  shift
+  "$@"
+  record "$current_step" ok ""
+  current_step=""
+}
+setup_log() {
+  mkdir -p "$(dirname "$LOG_FILE")"
+  exec >>"$LOG_FILE" 2>&1
+  printf '\n=== %s personal Vibes update ===\n' "$(date)"
+}
+node_env() {
+  [ -s "$NVM_DIR/nvm.sh" ] || { echo 'nvm is not installed; run /onboard to set it up.'; return 1; }
+  . "$NVM_DIR/nvm.sh" --no-use
+  nvm use --silent default >/dev/null
+}
+check_clean() {
+  [ -z "$(git -C "$repo" status --porcelain)" ] || { echo 'Local Vibes checkout is dirty; review required.'; return 1; }
+}
+save_templates() {
+  previous="$(mktemp -d)"
+  cp "$repo/settings.template.json" "$repo/subagent-config.template.json" "$repo/web-search.template.json" "$previous/"
+  [ ! -f "$repo/models.template.json" ] || cp "$repo/models.template.json" "$previous/"
+}
+packages() {
+  (cd "$repo" && npm ci --omit=dev --ignore-scripts && npm install --no-save --omit=dev codex-computer-use-mcp@latest @tmustier/pi-session-hud@latest)
+}
+install_pi() {
+  local pinned cutoff
+  pinned="$(node -p "require('$repo/package.json').devDependencies['@earendil-works/pi-coding-agent']")"
+  cutoff="$(node -p "require('$repo/package.json').piDependencyCutoff")"
+  [ "$(pi --version)" = "$pinned" ] || npm install -g --ignore-scripts --before "$cutoff" "@earendil-works/pi-coding-agent@$pinned"
+}
+run_step logging setup_log
+run_step node-env node_env
+run_step checkout check_clean
+run_step templates save_templates
+run_step fetch git -C "$repo" fetch --quiet origin main
+run_step merge git -C "$repo" merge --ff-only origin/main
+run_step packages packages
+run_step settings node "$repo/scripts/sync-settings.mjs" "$previous" "$repo" "$AGENT_DIR"
+run_step pi install_pi
+run_step startup "$repo/scripts/vibes" check
+run_step checkout-clean check_clean
 printf '=== update succeeded: %s ===\n' "$(git -C "$repo" rev-parse --short HEAD)"
+}
+home_update_main "$@"

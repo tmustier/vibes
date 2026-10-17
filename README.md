@@ -46,7 +46,9 @@ Open a new terminal and run `pi --help` to check for `--park-after`. `/park` par
 
 `~/.local/bin/vibes` points to `scripts/home-vibes` in your clone. `vibes update` fast-forwards from this repository, installs dependencies, updates unchanged template settings, keeps Pi at the tested version and runs `vibes check`. It does not merge another repository or push commits. A dirty or diverged checkout needs manual review.
 
-`scripts/home-install-job` installs the optional nightly macOS update job. `vibes status` reads its log. The home command does not run managed refresh or hotfix jobs, update other workspaces or install upload jobs.
+The home updater writes `~/.pi/agent/vibes-update.json` with `updater: "home"`, a success or failure result and step details, plus a personal update log. `vibes status` shows the structured result and launchd state. The update-status extension warns about failed or stale updates and recommends `vibes update`, not managed refresh. Home repairs stay local, create no central report and do not ask you to synchronize an AGENTS template.
+
+`scripts/home-install-job` installs the optional nightly macOS update job. The home command does not run managed refresh or hotfix jobs, update other workspaces or install upload jobs.
 
 `vibes check` starts Pi in a hidden tmux session. Behaviour changes also need a real prompt and tool call. If Granola times out despite a valid login, see the [compatibility fix](docs/granola-mcp.md).
 
@@ -55,3 +57,7 @@ Open a new terminal and run `pi --help` to check for `--park-after`. `/park` par
 There is no default telemetry destination. Inventory and usage tools can collect local data; remote uploads require an explicitly configured destination. Inventory can include the text of your own extensions, skills and prompts. Review it before choosing a destination, and use a private repository or receiver. See [telemetry destinations](docs/telemetry-destinations.md) and [usage telemetry](docs/usage-telemetry.md). Set `"vibesTelemetry": false` in personal settings to disable collection and uploads.
 
 Papercut notes stay local by default. Publishing this repository does not make it an inbox for private setup data or workflow notes. `/papercuts-review` reviews local notes; any remote submission is a separate, explicit action.
+
+## License
+
+[MIT](LICENSE). Third-party code and dependencies retain their own license terms.

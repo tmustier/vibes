@@ -4,7 +4,27 @@ case "${1:-}" in
   update) exec "$repo/scripts/home-update" ;;
   status)
     launchctl print "gui/$(id -u)/ai.personal.pi-update" 2>/dev/null | grep -E 'state =|last exit code =|runs =' || true
-    tail -20 "$HOME/Library/Logs/pi-personal-update.log" 2>/dev/null
+    python3 - "${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}/vibes-update.json" "$HOME/Library/Logs/pi-personal-update.log" <<'PY'
+from datetime import datetime
+import json
+from pathlib import Path
+import sys
+
+file, log = sys.argv[1:]
+path = Path(file)
+if not path.is_file():
+    print("No Vibes update has been recorded. Run `vibes update`.")
+    print(f"Log: {log}")
+    sys.exit(1)
+status = json.loads(path.read_text())
+finished = datetime.fromisoformat(status["finishedAt"].replace("Z", "+00:00")).astimezone()
+failed = not status.get("ok", True) or any(not step["ok"] for step in status["steps"])
+print(f"Last update: {finished:%d %b %Y %H:%M} ({'failed' if failed else 'succeeded'})")
+for step in status["steps"]:
+    detail = f" ({step['detail']})" if step.get("detail") else ""
+    print(f"  {'ok  ' if step['ok'] else 'FAIL'} {step['name']}{detail}")
+print(f"Log: {status['log']}")
+PY
     ;;
   refresh|hotfix|hotfix-check)
     echo 'This home setup does not run managed refresh or hotfix commands.' >&2

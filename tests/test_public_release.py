@@ -37,6 +37,18 @@ class PublicReleaseTests(unittest.TestCase):
         managed = (ROOT / "scripts/vibes").read_text()
         self.assertNotRegex(managed, r"step commercial\b")
 
+    def test_mit_license_and_third_party_notices(self):
+        license_text = (ROOT / "LICENSE").read_text()
+        self.assertIn("MIT License", license_text)
+        self.assertIn("Copyright (c) 2026 Thomas Mustier", license_text)
+        self.assertIn("Permission is hereby granted, free of charge", license_text)
+        manifest = json.loads((ROOT / "package.json").read_text())
+        lock = json.loads((ROOT / "package-lock.json").read_text())
+        self.assertEqual(manifest["license"], "MIT")
+        self.assertEqual(lock["packages"][""]["license"], "MIT")
+        self.assertIn("Matt Shumer", (ROOT / "skills/unslop/LICENSE").read_text())
+        self.assertTrue((ROOT / "skills/google-workspace-stack/LICENSE").is_file())
+
     def test_local_package_identity(self):
         manifest = json.loads((ROOT / "package.json").read_text())
         lock = json.loads((ROOT / "package-lock.json").read_text())

@@ -1,6 +1,7 @@
 {
   "name": "@tmustier/pi-anthropic-gzip",
   "private": true,
+  "license": "MIT",
   "version": "0.1.0",
   "type": "module",
   "description": "Compress direct Anthropic Messages uploads without changing prompts or authentication",

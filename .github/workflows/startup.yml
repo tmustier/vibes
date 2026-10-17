@@ -50,6 +50,7 @@ jobs:
       - run: node tests/test_fast_mode.mjs
       - run: node --test tests/test_granola_mcp_fetch.mjs
       - run: bash tests/test_home_command.sh
+      - run: python3 tests/test_home_update.py
       - run: npm run test:anthropic-gzip
       # The slow tests mostly wait on Pi and git, so they run side by side. Each has its own scratch
       # folder and tmux server. A test's output is printed once all of them have finished.

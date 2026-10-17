@@ -264,6 +264,6 @@ After any migration or update, and before telling the user it is done:
 2. Run `vibes check <folder>` for the folders the user works in that have their own `.pi` config, including the home folder if it has `~/.pi/skills/`. Project-local skills and extensions only load there. Check that the intended Vibes resource loaded, not just that the collision warning disappeared.
 3. After migrating duplicates, check in `vibes inventory` that each migrated resource loads from Vibes, the old copy does not, and unrelated resources still load.
 4. Run a real prompt through the tools you changed. For MCP, for example: `pi -p --no-session "Use the Linear MCP server to list the team keys."`. Inspect the tool calls as well as the answer. A config that loads is not the same as one that works.
-5. Run `vibes status` after changing the update job, and read `~/Library/Logs/pi-update.log` if any step failed.
+5. Run `vibes status` after changing the update job. It shows the last result, failed step and log path. Home updates use `~/Library/Logs/pi-personal-update.log`.
 
 Tell the user what you removed, what you turned off and why, and where the backups are.
