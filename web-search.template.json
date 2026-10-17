@@ -1,0 +1,6 @@
+{
+  "toolActivation": "auto",
+  "tools": {
+    "sourceCheck": { "enabled": false }
+  }
+}

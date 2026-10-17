@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# macOS
+.DS_Store
+
+# Secrets
+*.env
+*.env.*
+!*.env.example
+
+# Superhuman config (has personal identifiers)
+skills/superhuman/config.json
+
+node_modules/

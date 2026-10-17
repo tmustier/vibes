@@ -1,0 +1,12 @@
+{
+  "name": "@tmustier/pi-anthropic-gzip",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Compress direct Anthropic Messages uploads without changing prompts or authentication",
+  "pi": { "extensions": ["./index.ts"] },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*"
+  }
+}

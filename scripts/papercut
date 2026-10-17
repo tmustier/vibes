@@ -1,0 +1,1080 @@
+#!/usr/bin/env python3
+"""Append and review small, sanitized workflow-friction notes.
+
+This is deliberately a standalone local CLI: Pi agents can call it through the
+normal bash tool, while humans can use the same command from a shell.
+"""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+import re
+import stat
+import subprocess
+import sys
+from collections import Counter
+from dataclasses import asdict, dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Sequence
+
+GLOBAL_FILENAME = "PAPERCUTS.md"
+LOCAL_FILENAME = "PAPERCUTS.md"
+MAX_NOTE_CHARS = 600
+MAX_METADATA_CHARS = 240
+MAX_REVIEW_FILE_BYTES = 10 * 1024 * 1024
+MAX_SUBMISSIONS_PER_RUN = 50
+DEFAULT_SUBMISSION_LABEL = "papercut-inbox"
+SUBMISSION_LEDGER = "papercuts/submissions.jsonl"
+FILE_HEADER = """# Papercuts
+
+Append-only observations of small, real workflow friction. This is not a blocker log, work log, issue tracker, accomplishment list, or secret store.
+
+"""
+
+# Deliberately high-confidence patterns. The CLI rejects rather than redacts an
+# attempted append so a secret never reaches either papercuts file.
+SECRET_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    (
+        "private key",
+        re.compile(r"-----BEGIN (?:[A-Z0-9 ]+ )?PRIVATE KEY-----", re.IGNORECASE),
+    ),
+    (
+        "OpenAI or Anthropic API key",
+        re.compile(r"\bsk-(?:ant-|proj-)?[A-Za-z0-9_-]{16,}\b"),
+    ),
+    (
+        "GitHub token",
+        re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})\b"),
+    ),
+    (
+        "Slack token",
+        re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{12,}\b"),
+    ),
+    (
+        "AWS access key",
+        re.compile(r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b"),
+    ),
+    (
+        "Google API key",
+        re.compile(r"\bAIza[A-Za-z0-9_-]{30,}\b"),
+    ),
+    (
+        "Stripe secret key",
+        re.compile(r"\b(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{12,}\b"),
+    ),
+    (
+        "npm token",
+        re.compile(r"\bnpm_[A-Za-z0-9]{20,}\b"),
+    ),
+    (
+        "JWT",
+        re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b"),
+    ),
+    (
+        "bearer credential",
+        re.compile(r"\bBearer\s+[A-Za-z0-9._~+/=-]{12,}", re.IGNORECASE),
+    ),
+    (
+        "credential embedded in URL",
+        re.compile(r"\b[a-z][a-z0-9+.-]*://[^\s/:@]+:[^\s/@]+@", re.IGNORECASE),
+    ),
+)
+
+CREDENTIAL_ASSIGNMENT_RE = re.compile(
+    r"\b(?:api[_ -]?key|access[_ -]?token|auth[_ -]?token|password|passwd|secret|"
+    r"client[_ -]?secret|session[_ -]?(?:id|token)|cookie)\b\s*(?:=|:|\bis\b)\s*"
+    r"[\"']?(?P<value>[^\s,;\"']{8,})",
+    re.IGNORECASE,
+)
+EMAIL_RE = re.compile(r"(?<![\w.+-])[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}(?![\w-]|\.\w)", re.IGNORECASE)
+CARD_RE = re.compile(r"(?<!\d)(?:\d[ -]?){13,19}(?!\d)")
+SAFE_PLACEHOLDERS = {
+    "redacted",
+    "<redacted>",
+    "[redacted]",
+    "***",
+    "xxxxxxxx",
+    "placeholder",
+    "example",
+}
+COMMON_ABBREVIATIONS = ("e.g.", "i.e.", "etc.", "vs.", "Mr.", "Ms.", "Dr.")
+ENTRY_BLOCK_RE = re.compile(
+    r"^## (?P<timestamp>[^\n]+)\n(?P<body>(?:- [^\n]*\n?)+)",
+    re.MULTILINE,
+)
+FIELD_RE = re.compile(r"^- (?P<label>[^:]+): (?P<value>.*)$")
+CODE_VALUE_RE = re.compile(r"^`(?P<value>.*)`$")
+METADATA_KEYS = {
+    "thinkingLevel",
+    "sessionFile",
+    "sessionId",
+    "contextTokens",
+    "contextWindow",
+    "contextPercent",
+    "sessionBytes",
+    "sessionEntries",
+    "branchEntries",
+    "piVersion",
+    "surface",
+}
+
+
+class PapercutError(Exception):
+    """A safe, user-facing failure."""
+
+
+@dataclass(frozen=True)
+class Resolution:
+    target: Path
+    scope: str
+    reason: str
+    repo_root: Path | None = None
+
+
+@dataclass(frozen=True)
+class Entry:
+    timestamp: str
+    model: str
+    context: str
+    note: str
+    source: str
+    scope: str
+    thinking_level: str | None = None
+    session_file: str | None = None
+    session_id: str | None = None
+    context_tokens: int | None = None
+    context_window: int | None = None
+    context_percent: float | None = None
+    session_bytes: int | None = None
+    session_entries: int | None = None
+    branch_entries: int | None = None
+    pi_version: str | None = None
+    surface: str | None = None
+
+
+def _agent_dir() -> Path:
+    configured = os.environ.get("PI_CODING_AGENT_DIR")
+    return Path(configured).expanduser().resolve() if configured else Path.home() / ".pi" / "agent"
+
+
+def _global_file() -> Path:
+    return _agent_dir() / GLOBAL_FILENAME
+
+
+def _display_path(path: Path) -> str:
+    try:
+        absolute = path.expanduser().absolute()
+        return f"~/{absolute.relative_to(Path.home().expanduser().absolute())}"
+    except (ValueError, OSError):
+        return str(path)
+
+
+def _normalize_text(value: str, *, label: str, max_chars: int) -> str:
+    if "\x00" in value:
+        raise PapercutError(f"{label} contains a NUL byte; nothing was written")
+    normalized = " ".join(value.split())
+    if not normalized:
+        raise PapercutError(f"{label} must not be empty; nothing was written")
+    if len(normalized) > max_chars:
+        raise PapercutError(
+            f"{label} is {len(normalized)} characters (maximum {max_chars}); nothing was written"
+        )
+    return normalized
+
+
+def _secret_kind(value: str) -> str | None:
+    for label, pattern in SECRET_PATTERNS:
+        if pattern.search(value):
+            return label
+
+    assignment = CREDENTIAL_ASSIGNMENT_RE.search(value)
+    if assignment:
+        candidate = assignment.group("value").strip().lower()
+        if candidate not in SAFE_PLACEHOLDERS:
+            return "credential-like assignment"
+
+    if EMAIL_RE.search(value):
+        return "email address or private contact data"
+
+    card = CARD_RE.search(value)
+    if card:
+        digits = re.sub(r"\D", "", card.group(0))
+        if 13 <= len(digits) <= 19:
+            return "payment-card-like number"
+    return None
+
+
+def _validate_no_sensitive_data(*values: str) -> None:
+    for value in values:
+        kind = _secret_kind(value)
+        if kind:
+            raise PapercutError(
+                f"possible {kind} detected; nothing was written. Sanitize the note and retry"
+            )
+
+
+def _sentence_count(note: str) -> int:
+    scrubbed = re.sub(r"https?://\S+", "URL", note)
+    for abbreviation in COMMON_ABBREVIATIONS:
+        scrubbed = scrubbed.replace(abbreviation, abbreviation.replace(".", "∯"))
+    endings = re.findall(r"[.!?]+(?:[\"')\]]*)?(?=\s+|$)", scrubbed)
+    return max(1, len(endings))
+
+
+def _git_root(cwd: Path) -> Path | None:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(cwd), "rev-parse", "--show-toplevel"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    output = result.stdout.strip()
+    return Path(output).resolve() if output else None
+
+
+def _assert_safe_existing_target(path: Path) -> None:
+    if os.path.lexists(path) and path.is_symlink():
+        raise PapercutError(f"refusing symlink target {_display_path(path)}; nothing was written")
+    if path.exists() and not path.is_file():
+        raise PapercutError(f"target {_display_path(path)} is not a regular file; nothing was written")
+
+
+def _nearest_local_file(cwd: Path, repo_root: Path) -> Path | None:
+    current = cwd
+    while True:
+        candidate = current / LOCAL_FILENAME
+        if os.path.lexists(candidate):
+            _assert_safe_existing_target(candidate)
+            return candidate
+        if current == repo_root:
+            return None
+        parent = current.parent
+        if parent == current or repo_root not in (parent, *parent.parents):
+            return None
+        current = parent
+
+
+def _resolve(cwd: Path, scope: str) -> Resolution:
+    cwd = cwd.expanduser().resolve()
+    if not cwd.is_dir():
+        raise PapercutError(f"cwd is not a directory: {cwd}")
+
+    if scope == "global":
+        target = _global_file()
+        _assert_safe_existing_target(target)
+        return Resolution(target, "global", "explicit-global")
+
+    repo_root = _git_root(cwd)
+    if scope == "local" and repo_root is None:
+        raise PapercutError("--local requires a Git worktree; nothing was written")
+
+    if repo_root is not None:
+        local = _nearest_local_file(cwd, repo_root)
+        if local is not None:
+            reason = "explicit-local-existing" if scope == "local" else "nearest-local-override"
+            return Resolution(local, "local", reason, repo_root)
+        if scope == "local":
+            target = repo_root / LOCAL_FILENAME
+            _assert_safe_existing_target(target)
+            return Resolution(target, "local", "explicit-local-create-at-repo-root", repo_root)
+
+    target = _global_file()
+    _assert_safe_existing_target(target)
+    reason = "no-local-file" if repo_root is not None else "outside-git-worktree"
+    return Resolution(target, "global", reason, repo_root)
+
+
+def _default_context(cwd: Path) -> str:
+    cwd = cwd.resolve()
+    root = _git_root(cwd)
+    if root is None:
+        return f"cwd:{_display_path(cwd)}"
+    try:
+        relative = cwd.relative_to(root)
+    except ValueError:
+        relative = Path(".")
+    suffix = "" if str(relative) == "." else f"/{relative.as_posix()}"
+    return f"repo:{root.name}{suffix}"
+
+
+def _current_model(explicit: str | None) -> str:
+    if explicit:
+        return explicit
+    for name in ("PAPERCUT_MODEL", "PI_MODEL", "CODEX_MODEL", "CLAUDE_MODEL"):
+        value = os.environ.get(name)
+        if value:
+            return value
+    return "unknown"
+
+
+def _escape_code(value: str) -> str:
+    return value.replace("`", "\\`")
+
+
+def _unescape_code(value: str) -> str:
+    return value.replace("\\`", "`")
+
+
+def _metadata_from_json(raw: str | None) -> dict[str, object]:
+    if not raw:
+        return {}
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise PapercutError(f"invalid --metadata-json: {error.msg}; nothing was written") from error
+    if not isinstance(payload, dict):
+        raise PapercutError("--metadata-json must be a JSON object; nothing was written")
+    unknown = sorted(set(payload) - METADATA_KEYS)
+    if unknown:
+        raise PapercutError(f"unknown metadata field(s): {', '.join(unknown)}; nothing was written")
+
+    text_fields = ("thinkingLevel", "sessionFile", "sessionId", "piVersion", "surface")
+    integer_fields = ("contextTokens", "contextWindow", "sessionBytes", "sessionEntries", "branchEntries")
+    normalized: dict[str, object] = {}
+    for key in text_fields:
+        value = payload.get(key)
+        if value is not None:
+            if not isinstance(value, str):
+                raise PapercutError(f"metadata {key} must be a string or null; nothing was written")
+            normalized[key] = _normalize_text(value, label=f"metadata {key}", max_chars=1000)
+    for key in integer_fields:
+        value = payload.get(key)
+        if value is not None:
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise PapercutError(f"metadata {key} must be a non-negative integer or null; nothing was written")
+            normalized[key] = value
+    percent = payload.get("contextPercent")
+    if percent is not None:
+        if not isinstance(percent, (int, float)) or isinstance(percent, bool) or percent < 0:
+            raise PapercutError("metadata contextPercent must be a non-negative number or null; nothing was written")
+        normalized["contextPercent"] = round(float(percent), 2)
+    _validate_no_sensitive_data(*(str(value) for value in normalized.values()))
+    return normalized
+
+
+def _entry_markdown(
+    timestamp: str,
+    model: str,
+    context: str,
+    note: str,
+    metadata: dict[str, object] | None = None,
+) -> str:
+    metadata = metadata or {}
+    lines = [
+        f"## {timestamp}",
+        f"- Model: `{_escape_code(model)}`",
+    ]
+    if metadata.get("thinkingLevel") is not None:
+        lines.append(f"- Thinking level: `{_escape_code(str(metadata['thinkingLevel']))}`")
+    lines.append(f"- Context: `{_escape_code(context)}`")
+    if metadata.get("surface") is not None:
+        lines.append(f"- Surface: `{_escape_code(str(metadata['surface']))}`")
+    if metadata.get("sessionFile") is not None:
+        lines.append(f"- Session JSONL: `{_escape_code(_display_path(Path(str(metadata['sessionFile']))))}`")
+    if metadata.get("sessionId") is not None:
+        lines.append(f"- Session ID: `{_escape_code(str(metadata['sessionId']))}`")
+    if metadata.get("contextTokens") is not None or metadata.get("contextWindow") is not None:
+        tokens = metadata.get("contextTokens", "unknown")
+        window = metadata.get("contextWindow", "unknown")
+        percent = metadata.get("contextPercent")
+        suffix = f" ({percent:.2f}%)" if isinstance(percent, (int, float)) else ""
+        lines.append(f"- Context usage: `{tokens} / {window}{suffix}`")
+    if metadata.get("sessionBytes") is not None:
+        lines.append(f"- Session size: `{metadata['sessionBytes']} bytes`")
+    if metadata.get("sessionEntries") is not None or metadata.get("branchEntries") is not None:
+        total = metadata.get("sessionEntries", "unknown")
+        branch = metadata.get("branchEntries", "unknown")
+        lines.append(f"- Session entries: `{total} total / {branch} active branch`")
+    if metadata.get("piVersion") is not None:
+        lines.append(f"- Pi version: `{_escape_code(str(metadata['piVersion']))}`")
+    lines.append(f"- Friction: {note}")
+    return "\n".join(lines) + "\n\n"
+
+
+def _append_locked(path: Path, entry: str, *, mode: int) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _assert_safe_existing_target(path)
+
+    flags = os.O_RDWR | os.O_APPEND | os.O_CREAT
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+
+    try:
+        fd = os.open(path, flags, mode)
+    except OSError as error:
+        raise PapercutError(f"could not open {_display_path(path)} safely: {error.strerror}") from error
+
+    try:
+        with os.fdopen(fd, "r+b", closefd=True) as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            info = os.fstat(handle.fileno())
+            if not stat.S_ISREG(info.st_mode):
+                raise PapercutError(f"target {_display_path(path)} is not a regular file; nothing was written")
+
+            if info.st_size == 0:
+                payload = FILE_HEADER.encode("utf-8") + entry.encode("utf-8")
+            else:
+                handle.seek(-1, os.SEEK_END)
+                separator = b"" if handle.read(1) == b"\n" else b"\n"
+                payload = separator + entry.encode("utf-8")
+
+            handle.seek(0, os.SEEK_END)
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    except PapercutError:
+        raise
+    except OSError as error:
+        raise PapercutError(f"could not append to {_display_path(path)}: {error.strerror}") from error
+
+
+def _read_locked(path: Path) -> str:
+    _assert_safe_existing_target(path)
+    flags = os.O_RDONLY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(path, flags)
+    except FileNotFoundError:
+        return ""
+    except OSError as error:
+        raise PapercutError(f"could not open {_display_path(path)} safely: {error.strerror}") from error
+
+    try:
+        with os.fdopen(fd, "rb", closefd=True) as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_SH)
+            payload = handle.read(MAX_REVIEW_FILE_BYTES + 1)
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    except OSError as error:
+        raise PapercutError(f"could not read {_display_path(path)} safely: {error.strerror}") from error
+
+    if len(payload) > MAX_REVIEW_FILE_BYTES:
+        raise PapercutError(
+            f"refusing to review {_display_path(path)} because it exceeds {MAX_REVIEW_FILE_BYTES} bytes"
+        )
+    try:
+        return payload.decode("utf-8")
+    except UnicodeError as error:
+        raise PapercutError(f"could not decode {_display_path(path)} as UTF-8") from error
+
+
+def _plain_field(value: str) -> str:
+    code = CODE_VALUE_RE.match(value)
+    return _unescape_code(code.group("value")) if code else value
+
+
+def _parse_int_prefix(value: str) -> int | None:
+    match = re.match(r"^(\d+)", value)
+    return int(match.group(1)) if match else None
+
+
+def _parse_context_usage(value: str) -> tuple[int | None, int | None, float | None]:
+    match = re.match(r"^(\d+|unknown) / (\d+|unknown)(?: \(([0-9.]+)%\))?$", value)
+    if not match:
+        return None, None, None
+    tokens = None if match.group(1) == "unknown" else int(match.group(1))
+    window = None if match.group(2) == "unknown" else int(match.group(2))
+    percent = float(match.group(3)) if match.group(3) else None
+    return tokens, window, percent
+
+
+def _parse_entries(path: Path, scope: str) -> list[Entry]:
+    content = _read_locked(path)
+    if not content:
+        return []
+
+    entries: list[Entry] = []
+    for match in ENTRY_BLOCK_RE.finditer(content):
+        fields: dict[str, str] = {}
+        for line in match.group("body").splitlines():
+            field_match = FIELD_RE.match(line)
+            if field_match:
+                fields[field_match.group("label")] = _plain_field(field_match.group("value"))
+        model = fields.get("Model")
+        context = fields.get("Context")
+        note = fields.get("Friction")
+        if model is None or context is None or note is None:
+            continue
+
+        context_tokens, context_window, context_percent = _parse_context_usage(
+            fields.get("Context usage", "")
+        )
+        session_entries = branch_entries = None
+        entries_value = fields.get("Session entries", "")
+        entries_match = re.match(r"^(\d+|unknown) total / (\d+|unknown) active branch$", entries_value)
+        if entries_match:
+            session_entries = None if entries_match.group(1) == "unknown" else int(entries_match.group(1))
+            branch_entries = None if entries_match.group(2) == "unknown" else int(entries_match.group(2))
+
+        sensitive_values = [model, context, note]
+        sensitive_values.extend(
+            value
+            for value in (fields.get("Surface"), fields.get("Session JSONL"), fields.get("Session ID"))
+            if value is not None
+        )
+        if _secret_kind(" ".join(sensitive_values)):
+            model = "[redacted]"
+            context = "[redacted]"
+            note = "[redacted: possible sensitive data in stored entry]"
+
+        entries.append(
+            Entry(
+                timestamp=match.group("timestamp"),
+                model=model,
+                context=context,
+                note=note,
+                source=_display_path(path),
+                scope=scope,
+                thinking_level=fields.get("Thinking level"),
+                session_file=fields.get("Session JSONL"),
+                session_id=fields.get("Session ID"),
+                context_tokens=context_tokens,
+                context_window=context_window,
+                context_percent=context_percent,
+                session_bytes=_parse_int_prefix(fields.get("Session size", "")),
+                session_entries=session_entries,
+                branch_entries=branch_entries,
+                pi_version=fields.get("Pi version"),
+                surface=fields.get("Surface"),
+            )
+        )
+    return entries
+
+
+def _entry_fingerprint(entry: Entry) -> str:
+    payload = asdict(entry)
+    payload.pop("source", None)
+    payload.pop("scope", None)
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _submission_ledger() -> Path:
+    return _agent_dir() / SUBMISSION_LEDGER
+
+
+def _append_jsonl_locked(path: Path, payload: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _assert_safe_existing_target(path)
+    flags = os.O_RDWR | os.O_APPEND | os.O_CREAT
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(path, flags, 0o600)
+    except OSError as error:
+        raise PapercutError(f"could not open submission ledger safely: {error.strerror}") from error
+    try:
+        with os.fdopen(fd, "a", encoding="utf-8", closefd=True) as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                raise PapercutError("submission ledger is not a regular file")
+            handle.write(json.dumps(payload, sort_keys=True) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    except PapercutError:
+        raise
+    except OSError as error:
+        raise PapercutError(f"could not update submission ledger: {error.strerror}") from error
+
+
+def _submitted_fingerprints() -> dict[str, str]:
+    ledger = _submission_ledger()
+    _assert_safe_existing_target(ledger)
+    if not ledger.exists():
+        return {}
+    submitted: dict[str, str] = {}
+    try:
+        with ledger.open("r", encoding="utf-8") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_SH)
+            for line in handle:
+                try:
+                    receipt = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                fingerprint = receipt.get("fingerprint")
+                url = receipt.get("url")
+                if isinstance(fingerprint, str) and isinstance(url, str):
+                    submitted[fingerprint] = url
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    except OSError as error:
+        raise PapercutError(f"could not read submission ledger: {error.strerror}") from error
+    return submitted
+
+
+def _issue_body(entry: Entry, fingerprint: str) -> str:
+    context_usage = "unknown"
+    if entry.context_tokens is not None or entry.context_window is not None:
+        tokens = entry.context_tokens if entry.context_tokens is not None else "unknown"
+        window = entry.context_window if entry.context_window is not None else "unknown"
+        percent = f" ({entry.context_percent:.2f}%)" if entry.context_percent is not None else ""
+        context_usage = f"{tokens} / {window}{percent}"
+    session_entries = "unknown"
+    if entry.session_entries is not None or entry.branch_entries is not None:
+        total = entry.session_entries if entry.session_entries is not None else "unknown"
+        branch = entry.branch_entries if entry.branch_entries is not None else "unknown"
+        session_entries = f"{total} total / {branch} active branch"
+
+    def value(item: object | None) -> str:
+        return "unknown" if item is None else str(item).replace("`", "\\`")
+
+    safe_note = entry.note.replace("@", "@\u200b")
+    return "\n".join(
+        [
+            f"<!-- papercut-id:{fingerprint} -->",
+            "## Friction",
+            "",
+            safe_note,
+            "",
+            "## Capture metadata",
+            "",
+            f"- Observed: `{value(entry.timestamp)}`",
+            f"- Model: `{value(entry.model)}`",
+            f"- Thinking level: `{value(entry.thinking_level)}`",
+            f"- Context: `{value(entry.context)}`",
+            f"- Surface: `{value(entry.surface)}`",
+            f"- Session JSONL: `{value(entry.session_file)}`",
+            f"- Session ID: `{value(entry.session_id)}`",
+            f"- Context usage: `{context_usage}`",
+            f"- Session size: `{value(entry.session_bytes)} bytes`",
+            f"- Session entries: `{session_entries}`",
+            f"- Pi version: `{value(entry.pi_version)}`",
+            "",
+            "No session messages, prompts, tool results, or JSONL contents were uploaded by the papercut collector.",
+        ]
+    )
+
+
+def _gh(args: list[str], *, timeout: int = 20) -> subprocess.CompletedProcess[str]:
+    try:
+        return subprocess.run(
+            ["gh", *args],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except FileNotFoundError as error:
+        raise PapercutError("GitHub CLI is not installed; the papercut remains pending locally") from error
+    except subprocess.TimeoutExpired as error:
+        raise PapercutError("GitHub submission timed out; the papercut remains pending locally") from error
+
+
+def _submit_entry(entry: Entry, repo: str, submitted: dict[str, str]) -> tuple[str, bool]:
+    fingerprint = _entry_fingerprint(entry)
+    if fingerprint in submitted:
+        return submitted[fingerprint], False
+
+    search = _gh(
+        [
+            "issue",
+            "list",
+            "--repo",
+            repo,
+            "--state",
+            "all",
+            "--search",
+            f"papercut-id:{fingerprint} in:body",
+            "--limit",
+            "1",
+            "--json",
+            "url",
+            "--jq",
+            ".[0].url // empty",
+        ]
+    )
+    if search.returncode == 0 and search.stdout.strip():
+        url = search.stdout.strip()
+    else:
+        title_note = entry.note if len(entry.note) <= 72 else entry.note[:69].rstrip() + "..."
+        created = _gh(
+            [
+                "issue",
+                "create",
+                "--repo",
+                repo,
+                "--label",
+                DEFAULT_SUBMISSION_LABEL,
+                "--title",
+                f"Papercut: {title_note}",
+                "--body",
+                _issue_body(entry, fingerprint),
+            ],
+            timeout=30,
+        )
+        if created.returncode != 0 or not created.stdout.strip():
+            reason = created.stderr.strip().splitlines()[-1] if created.stderr.strip() else "unknown GitHub error"
+            raise PapercutError(f"GitHub submission failed ({reason}); the papercut remains pending locally")
+        url = created.stdout.strip().splitlines()[-1]
+
+    _append_jsonl_locked(
+        _submission_ledger(),
+        {
+            "fingerprint": fingerprint,
+            "repo": repo,
+            "url": url,
+            "submittedAt": datetime.now().astimezone().isoformat(timespec="seconds"),
+        },
+    )
+    submitted[fingerprint] = url
+    return url, True
+
+
+def _timestamp_sort_key(value: str) -> tuple[int, str]:
+    try:
+        parsed = datetime.fromisoformat(value)
+        return (1, parsed.astimezone().isoformat())
+    except (ValueError, TypeError):
+        return (0, value)
+
+
+def _after_since(entry: Entry, since: str | None) -> bool:
+    if since is None:
+        return True
+    try:
+        cutoff = datetime.fromisoformat(since)
+        observed = datetime.fromisoformat(entry.timestamp)
+        if cutoff.tzinfo is None and observed.tzinfo is not None:
+            return observed.date() >= cutoff.date()
+        if cutoff.tzinfo is not None and observed.tzinfo is None:
+            return observed.date() >= cutoff.date()
+        return observed >= cutoff
+    except ValueError as error:
+        raise PapercutError(f"invalid --since value {since!r}; use YYYY-MM-DD or an ISO-8601 timestamp") from error
+
+
+def _scope_from_args(args: argparse.Namespace) -> str:
+    if getattr(args, "global_scope", False):
+        return "global"
+    if getattr(args, "local_scope", False):
+        return "local"
+    return "auto"
+
+
+def _cmd_add(args: argparse.Namespace) -> int:
+    cwd = Path(args.cwd)
+    note = _normalize_text(" ".join(args.note), label="note", max_chars=MAX_NOTE_CHARS)
+    if _sentence_count(note) > 2:
+        raise PapercutError("note must be one or two sentences; split longer observations into separate papercuts")
+
+    model = _normalize_text(_current_model(args.model), label="model", max_chars=MAX_METADATA_CHARS)
+    context = _normalize_text(
+        args.context if args.context else _default_context(cwd),
+        label="context",
+        max_chars=MAX_METADATA_CHARS,
+    )
+    metadata = _metadata_from_json(args.metadata_json)
+    _validate_no_sensitive_data(note, model, context)
+
+    resolution = _resolve(cwd, _scope_from_args(args))
+    timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
+    markdown = _entry_markdown(timestamp, model, context, note, metadata)
+
+    if not args.dry_run:
+        mode = 0o600 if resolution.scope == "global" else 0o644
+        _append_locked(resolution.target, markdown, mode=mode)
+
+    captured = Entry(
+        timestamp=timestamp,
+        model=model,
+        context=context,
+        note=note,
+        source=_display_path(resolution.target),
+        scope=resolution.scope,
+        thinking_level=metadata.get("thinkingLevel") if isinstance(metadata.get("thinkingLevel"), str) else None,
+        session_file=(
+            _display_path(Path(str(metadata["sessionFile"]))) if metadata.get("sessionFile") is not None else None
+        ),
+        session_id=metadata.get("sessionId") if isinstance(metadata.get("sessionId"), str) else None,
+        context_tokens=metadata.get("contextTokens") if isinstance(metadata.get("contextTokens"), int) else None,
+        context_window=metadata.get("contextWindow") if isinstance(metadata.get("contextWindow"), int) else None,
+        context_percent=(
+            float(metadata["contextPercent"])
+            if isinstance(metadata.get("contextPercent"), (int, float))
+            else None
+        ),
+        session_bytes=metadata.get("sessionBytes") if isinstance(metadata.get("sessionBytes"), int) else None,
+        session_entries=(
+            metadata.get("sessionEntries") if isinstance(metadata.get("sessionEntries"), int) else None
+        ),
+        branch_entries=metadata.get("branchEntries") if isinstance(metadata.get("branchEntries"), int) else None,
+        pi_version=metadata.get("piVersion") if isinstance(metadata.get("piVersion"), str) else None,
+        surface=metadata.get("surface") if isinstance(metadata.get("surface"), str) else None,
+    )
+
+    submission_url: str | None = None
+    submission_error: str | None = None
+    if args.submit_repo and not args.dry_run:
+        try:
+            submission_url, _created = _submit_entry(captured, args.submit_repo, _submitted_fingerprints())
+        except PapercutError as error:
+            submission_error = str(error)
+
+    result = {
+        "status": "dry-run" if args.dry_run else "recorded",
+        "target": str(resolution.target),
+        "displayTarget": _display_path(resolution.target),
+        "scope": resolution.scope,
+        "reason": resolution.reason,
+        "timestamp": timestamp,
+        "model": model,
+        "context": context,
+        "metadata": metadata,
+        "submissionRepo": args.submit_repo,
+        "submissionUrl": submission_url,
+        "submissionError": submission_error,
+    }
+    if args.json:
+        print(json.dumps(result, indent=2, sort_keys=True))
+    else:
+        verb = "Would record" if args.dry_run else "Recorded"
+        print(f"{verb} papercut -> {result['displayTarget']} ({resolution.reason})")
+        if submission_url:
+            print(f"Submitted papercut -> {submission_url}")
+        elif submission_error:
+            print(f"papercut: warning: {submission_error}", file=sys.stderr)
+    return 0
+
+
+def _cmd_resolve(args: argparse.Namespace) -> int:
+    resolution = _resolve(Path(args.cwd), _scope_from_args(args))
+    result = {
+        "target": str(resolution.target),
+        "displayTarget": _display_path(resolution.target),
+        "scope": resolution.scope,
+        "reason": resolution.reason,
+        "exists": resolution.target.exists(),
+        "repoRoot": str(resolution.repo_root) if resolution.repo_root else None,
+    }
+    if args.json:
+        print(json.dumps(result, indent=2, sort_keys=True))
+    else:
+        print(result["displayTarget"])
+        print(f"scope={result['scope']} reason={result['reason']} exists={str(result['exists']).lower()}")
+    return 0
+
+
+def _review_sources(cwd: Path, args: argparse.Namespace) -> list[tuple[Path, str]]:
+    if args.all_scopes:
+        sources: list[tuple[Path, str]] = [(_global_file(), "global")]
+        repo_root = _git_root(cwd.resolve())
+        if repo_root is not None:
+            local = _nearest_local_file(cwd.resolve(), repo_root)
+            if local is not None and local != sources[0][0]:
+                sources.append((local, "local"))
+        return sources
+
+    resolution = _resolve(cwd, _scope_from_args(args))
+    return [(resolution.target, resolution.scope)]
+
+
+def _cmd_review(args: argparse.Namespace) -> int:
+    cwd = Path(args.cwd).expanduser().resolve()
+    sources = _review_sources(cwd, args)
+    entries: list[Entry] = []
+    for path, scope in sources:
+        entries.extend(_parse_entries(path, scope))
+    entries = [entry for entry in entries if _after_since(entry, args.since)]
+    entries.sort(key=lambda entry: _timestamp_sort_key(entry.timestamp), reverse=True)
+    total = len(entries)
+    shown = entries[: args.limit]
+
+    if args.json:
+        output = {
+            "sources": [
+                {"path": str(path), "displayPath": _display_path(path), "scope": scope, "exists": path.exists()}
+                for path, scope in sources
+            ],
+            "matched": total,
+            "shown": len(shown),
+            "entries": [asdict(entry) for entry in shown],
+        }
+        print(json.dumps(output, indent=2, sort_keys=True))
+        return 0
+
+    print("# Papercut review")
+    print()
+    print("Explicit one-off review bundle; no automatic session mining was run.")
+    print(f"Sources: {', '.join(_display_path(path) for path, _ in sources)}")
+    print(f"Matched: {total}; showing newest: {len(shown)}")
+    if shown:
+        models = Counter(entry.model for entry in shown)
+        contexts = Counter(entry.context for entry in shown)
+        print("Models: " + ", ".join(f"{name} ({count})" for name, count in models.most_common()))
+        print("Contexts: " + ", ".join(f"{name} ({count})" for name, count in contexts.most_common(8)))
+        print()
+        print("## Recent friction")
+        print()
+        for entry in shown:
+            print(
+                f"- {entry.timestamp} · {entry.scope} · `{entry.model}` · `{entry.context}` · "
+                f"{entry.note} _(source: {entry.source})_"
+            )
+    else:
+        print()
+        print("No structured papercut entries matched.")
+    return 0
+
+
+def _cmd_submit(args: argparse.Namespace) -> int:
+    cwd = Path(args.cwd).expanduser().resolve()
+    sources = _review_sources(cwd, args)
+    entries: list[Entry] = []
+    for path, scope in sources:
+        entries.extend(_parse_entries(path, scope))
+    entries.sort(key=lambda entry: _timestamp_sort_key(entry.timestamp))
+
+    submitted = _submitted_fingerprints()
+    pending = [entry for entry in entries if _entry_fingerprint(entry) not in submitted]
+    selected = pending[: args.limit]
+    created: list[dict[str, str]] = []
+    errors: list[str] = []
+    for entry in selected:
+        try:
+            url, was_created = _submit_entry(entry, args.repo, submitted)
+            created.append(
+                {
+                    "fingerprint": _entry_fingerprint(entry),
+                    "url": url,
+                    "status": "created" if was_created else "existing",
+                }
+            )
+        except PapercutError as error:
+            errors.append(str(error))
+            break
+
+    result = {
+        "repo": args.repo,
+        "sources": [_display_path(path) for path, _scope in sources],
+        "pendingBefore": len(pending),
+        "attempted": len(selected),
+        "submitted": created,
+        "errors": errors,
+        "remaining": max(0, len(pending) - len(created)),
+    }
+    if args.json:
+        print(json.dumps(result, indent=2, sort_keys=True))
+    else:
+        print(f"Papercut submission -> {args.repo}")
+        print(f"Pending before: {len(pending)}; submitted: {len(created)}; remaining: {result['remaining']}")
+        for item in created:
+            print(f"- {item['status']}: {item['url']}")
+        for error in errors:
+            print(f"papercut: {error}", file=sys.stderr)
+    return 2 if errors else 0
+
+
+def _add_scope_flags(parser: argparse.ArgumentParser, *, include_all: bool = False) -> None:
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--global", dest="global_scope", action="store_true", help="use the global papercuts file")
+    group.add_argument(
+        "--local",
+        dest="local_scope",
+        action="store_true",
+        help="use/create the nearest repo-local papercuts file",
+    )
+    if include_all:
+        group.add_argument(
+            "--all",
+            dest="all_scopes",
+            action="store_true",
+            help="review the global file plus the effective nearest local override",
+        )
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="papercut",
+        description="Record small, real workflow friction without turning it into an issue tracker.",
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    add = subparsers.add_parser("add", help="append a one- or two-sentence papercut")
+    _add_scope_flags(add)
+    add.add_argument("--model", help="current provider/model (falls back to known model environment variables)")
+    add.add_argument("--context", help="short sanitized task/repo context (defaults to cwd/repo)")
+    add.add_argument("--cwd", default=os.getcwd(), help=argparse.SUPPRESS)
+    add.add_argument("--dry-run", action="store_true", help="show resolution without writing")
+    add.add_argument("--json", action="store_true", help="emit machine-readable result metadata")
+    add.add_argument("--metadata-json", help=argparse.SUPPRESS)
+    add.add_argument("--submit-repo", help="submit the recorded entry to this GitHub issue repository")
+    add.add_argument("note", nargs="+", help="one or two sanitized sentences")
+    add.set_defaults(func=_cmd_add)
+
+    resolve = subparsers.add_parser("resolve", help="show the file the current directory resolves to")
+    _add_scope_flags(resolve)
+    resolve.add_argument("--cwd", default=os.getcwd(), help="resolve as if run from this directory")
+    resolve.add_argument("--json", action="store_true", help="emit machine-readable resolution details")
+    resolve.set_defaults(func=_cmd_resolve)
+
+    review = subparsers.add_parser("review", help="build an on-demand review bundle from recorded friction")
+    _add_scope_flags(review, include_all=True)
+    review.add_argument("--cwd", default=os.getcwd(), help="review as if run from this directory")
+    review.add_argument("--limit", type=int, default=50, help="maximum newest entries to show (default: 50)")
+    review.add_argument("--since", help="only include entries on/after an ISO date or timestamp")
+    review.add_argument("--json", action="store_true", help="emit machine-readable entries")
+    review.set_defaults(func=_cmd_review)
+
+    submit = subparsers.add_parser("submit", help="submit locally recorded papercuts to a GitHub issue inbox")
+    _add_scope_flags(submit, include_all=True)
+    submit.add_argument("--cwd", default=os.getcwd(), help="submit as if run from this directory")
+    submit.add_argument("--repo", required=True, help="GitHub owner/repository for the private papercut inbox")
+    submit.add_argument(
+        "--limit",
+        type=int,
+        default=MAX_SUBMISSIONS_PER_RUN,
+        help=f"maximum pending entries to submit (default: {MAX_SUBMISSIONS_PER_RUN})",
+    )
+    submit.add_argument("--json", action="store_true", help="emit machine-readable submission results")
+    submit.set_defaults(func=_cmd_submit)
+
+    return parser
+
+
+def _normalize_argv(argv: Sequence[str]) -> list[str]:
+    if not argv:
+        return []
+    commands = {"add", "resolve", "review", "submit"}
+    if argv[0] in commands or argv[0] in {"-h", "--help"}:
+        return list(argv)
+    return ["add", *argv]
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = _build_parser()
+    normalized = _normalize_argv(list(sys.argv[1:] if argv is None else argv))
+    if not normalized:
+        parser.print_help(sys.stderr)
+        return 2
+    try:
+        args = parser.parse_args(normalized)
+        if getattr(args, "limit", 1) < 1:
+            raise PapercutError("--limit must be at least 1")
+        return int(args.func(args))
+    except PapercutError as error:
+        print(f"papercut: {error}", file=sys.stderr)
+        return 2
+    except BrokenPipeError:
+        return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

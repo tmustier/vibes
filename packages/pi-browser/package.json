@@ -1,0 +1,17 @@
+{
+  "name": "@tmustier/pi-browser",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Persistent agent-controlled Chrome browser for Pi",
+  "pi": {
+    "extensions": ["./index.ts"]
+  },
+  "dependencies": {
+    "playwright": "1.62.1"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*"
+  }
+}

@@ -1,0 +1,73 @@
+#!/usr/bin/env python3
+"""Read a local vibes-telemetry checkout and emit per-user usage for an inclusive UTC period."""
+import argparse
+from datetime import date
+import importlib.machinery
+import importlib.util
+import json
+from pathlib import Path
+
+loader = importlib.machinery.SourceFileLoader("usage_telemetry", str(Path(__file__).with_name("usage-telemetry")))
+telemetry = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+loader.exec_module(telemetry)
+
+
+def report(root, start, end):
+    users = {}
+    seen = set()
+    for path in sorted((root / "usage").glob("*/*/????-??.json")):
+        document = json.loads(path.read_text())
+        if document.get("schema") != 1:
+            raise ValueError("Unsupported usage schema")
+        login = path.parent.parent.name
+        installation = document["installationId"]
+        for stamp, bucket in document["days"].items():
+            if not start <= date.fromisoformat(stamp) <= end:
+                continue
+            key = (login, installation, stamp)
+            if key in seen:
+                raise ValueError("Duplicate installation/day in checkout")
+            seen.add(key)
+            user = users.setdefault(login, {"models": {}, "tools": {}, "skills": {}, "extensions": {},
+                "loadedResources": {}, "nestedCoverage": {"complete": 0, "incomplete": 0, "unrecorded": 0}})
+            for row in bucket["models"]:
+                dimensions = tuple(row.get(k, "unknown") for k in telemetry.DIMENSIONS)
+                total = user["models"].setdefault(dimensions, {**dict(zip(telemetry.DIMENSIONS, dimensions)),
+                    **dict.fromkeys((*telemetry.TOKENS, "records"), 0), "cost": dict.fromkeys(telemetry.COSTS, 0)})
+                for field in (*telemetry.TOKENS, "records"):
+                    total[field] += row.get(field, 0)
+                for field in telemetry.COSTS:
+                    total["cost"][field] += row.get("cost", {}).get(field, 0)
+            for row in bucket["tools"]:
+                dimensions = tuple(row[k] for k in ("tool", "extension", "nested"))
+                total = user["tools"].setdefault(dimensions, {**dict(zip(("tool", "extension", "nested"), dimensions)),
+                    **dict.fromkeys(("attempts", "results", "errors", "unfinished"), 0)})
+                for field in ("attempts", "results", "errors", "unfinished"):
+                    total[field] += row[field]
+            for field in ("skills", "extensions", "loadedResources", "nestedCoverage"):
+                for name, count in bucket[field].items():
+                    user[field][name] = user[field].get(name, 0) + count
+    for user in users.values():
+        user["models"] = sorted(user["models"].values(), key=telemetry.packed)
+        user["tools"] = sorted(user["tools"].values(), key=telemetry.packed)
+        for row in user["models"]:
+            denominator = row["input"] + row["cacheRead"] + row["cacheWrite"]
+            row["cacheHitPercent"] = row["cacheRead"] / denominator * 100 if denominator else None
+    return {"schema": 1, "from": start.isoformat(), "to": end.isoformat(), "bucket": "daily-UTC", "users": users}
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("root", type=Path, help="local telemetry checkout root (contains usage/)")
+    parser.add_argument("--from", dest="start", required=True, type=date.fromisoformat)
+    parser.add_argument("--to", dest="end", required=True, type=date.fromisoformat)
+    args = parser.parse_args()
+    if args.start > args.end:
+        parser.error("--from must not be after --to")
+    if not (args.root / "usage").is_dir():
+        parser.error("checkout root must contain usage/")
+    print(telemetry.packed(report(args.root, args.start, args.end)))
+
+
+if __name__ == "__main__":
+    main()

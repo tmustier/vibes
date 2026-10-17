@@ -1,0 +1,71 @@
+#!/bin/zsh
+# Opt-in wrapper for extensions/park.ts. Runs the real pi; when a session is parked, keeps the
+# terminal exactly as pi left it and waits for a keypress (or a touch of
+# "$PI_PARK_FILE.wake") before relaunching pi on the parked session.
+#
+# Users opt in by aliasing pi to this file in ~/.zshrc (see the README). It finds the first pi
+# on PATH that is not itself, so it survives npm global upgrades.
+emulate -L zsh
+
+self="${0:A}"
+real_pi=""
+for dir in $path; do
+	candidate="$dir/pi"
+	[[ -x "$candidate" && "${candidate:A}" != "$self" ]] || continue
+	real_pi="$candidate"
+	break
+done
+if [[ -z "$real_pi" ]]; then
+	print -u2 -- "pi wrapper: no other pi executable found on PATH"
+	exit 127
+fi
+
+export PI_PARK_FILE="${TMPDIR:-/tmp}/pi-park.$$.$RANDOM"
+export PI_PARK_WRAPPER_PID=$$
+wake_file="$PI_PARK_FILE.wake"
+draft_file="$PI_PARK_FILE.draft"
+typeset -a args record
+args=("$@")
+session_file=""
+
+cleanup() {
+	rm -f -- "$PI_PARK_FILE" "$wake_file" "$draft_file"
+	tput cnorm 2>/dev/null
+	printf '\n\e[2mParked session closed. To resume it: pi --session %s\e[0m\n' "${(q)session_file}"
+	exit 130
+}
+
+while true; do
+	"$real_pi" "${args[@]}"
+	status_code=$?
+	if [[ ! -s "$PI_PARK_FILE" ]]; then
+		rm -f -- "$PI_PARK_FILE" "$wake_file" "$draft_file"
+		exit $status_code
+	fi
+
+	record=("${(@0)$(<"$PI_PARK_FILE")}")
+	rm -f -- "$PI_PARK_FILE"
+	cwd="$record[1]"
+	title="$record[2]"
+	session_file="$record[3]"
+	args=("${(@)record[4,-1]}")
+
+	printf '\e]0;⏸ %s\a' "$title"
+	printf '\e[2m⏸ parked · any key wakes it\e[0m'
+	tput civis 2>/dev/null
+	trap cleanup INT TERM HUP
+	if [[ -t 0 ]]; then
+		until read -s -k 1 -t 2; do
+			[[ -e "$wake_file" ]] && break
+		done
+	else
+		until [[ -e "$wake_file" ]]; do
+			sleep 2
+		done
+	fi
+	trap - INT TERM HUP
+	rm -f -- "$wake_file"
+	tput cnorm 2>/dev/null
+	printf '\r\e[2K'
+	cd -- "$cwd" || exit 1
+done

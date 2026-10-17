@@ -1,0 +1,14 @@
+#!/bin/bash
+repo="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+case "${1:-}" in
+  update) exec "$repo/scripts/home-update" ;;
+  status)
+    launchctl print "gui/$(id -u)/ai.personal.pi-update" 2>/dev/null | grep -E 'state =|last exit code =|runs =' || true
+    tail -20 "$HOME/Library/Logs/pi-personal-update.log" 2>/dev/null
+    ;;
+  refresh|hotfix|hotfix-check)
+    echo 'This home setup does not run managed refresh or hotfix commands.' >&2
+    exit 2
+    ;;
+  *) exec "$repo/scripts/vibes" "$@" ;;
+esac

@@ -1,0 +1,183 @@
+#!/usr/bin/env bash
+set -euo pipefail
+umask 077
+
+SOURCE_PATH="${BASH_SOURCE[0]}"
+while [[ -h "$SOURCE_PATH" ]]; do
+  SOURCE_DIR="$(cd -P "$(dirname "$SOURCE_PATH")" && pwd)"
+  LINK_TARGET="$(readlink "$SOURCE_PATH")"
+  if [[ "$LINK_TARGET" != /* ]]; then
+    SOURCE_PATH="$SOURCE_DIR/$LINK_TARGET"
+  else
+    SOURCE_PATH="$LINK_TARGET"
+  fi
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE_PATH")" && pwd)"
+# shellcheck source=./common.sh
+source "$SCRIPT_DIR/common.sh"
+
+CACHE_ENABLED=1
+ACCOUNT_OVERRIDE="${GOG_ACCOUNT:-}"
+ARGS=()
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --gog-account)
+      if [[ $# -lt 2 ]]; then
+        log "gws wrapper: --gog-account requires an email"
+        exit 2
+      fi
+      ACCOUNT_OVERRIDE="$2"
+      shift 2
+      ;;
+    --no-token-cache)
+      CACHE_ENABLED=0
+      shift
+      ;;
+    *)
+      ARGS+=("$1")
+      shift
+      ;;
+  esac
+done
+
+require_cmd gog
+require_cmd jq
+require_cmd curl
+require_cmd python3
+
+if [[ ! -x "$RAW_GWS_BIN" ]]; then
+  log "gws wrapper: raw gws binary not found at $RAW_GWS_BIN"
+  log "Run: $REPO_ROOT/scripts/sync-googleworkspace-cli.sh"
+  exit 1
+fi
+
+GOG_STATUS_JSON="$(gog status --json 2>/dev/null || true)"
+DEFAULT_ACCOUNT="$(printf '%s' "$GOG_STATUS_JSON" | jq -r '.account.email // empty')"
+DEFAULT_CREDENTIALS_PATH="$(printf '%s' "$GOG_STATUS_JSON" | jq -r '.account.credentials_path // empty')"
+
+ACCOUNT="$ACCOUNT_OVERRIDE"
+if [[ -z "$ACCOUNT" ]]; then
+  ACCOUNT="$DEFAULT_ACCOUNT"
+fi
+if [[ -z "$ACCOUNT" ]]; then
+  ACCOUNT="$(gog auth list --json 2>/dev/null | jq -r '.accounts[0].email // empty')"
+fi
+if [[ -z "$ACCOUNT" ]]; then
+  log "gws wrapper: could not determine a gog account; set GOG_ACCOUNT or use --gog-account"
+  exit 1
+fi
+
+GOG_CLIENT_CREDENTIALS="${GOG_CLIENT_CREDENTIALS_FILE:-${DEFAULT_CREDENTIALS_PATH:-${HOME}/Library/Application Support/gogcli/credentials.json}}"
+
+ensure_dir_secure "$CACHE_DIR"
+ACCOUNT_KEY="$(resolve_account_cache_key "$ACCOUNT")"
+TOKEN_CACHE="$CACHE_DIR/access-token.$ACCOUNT_KEY.json"
+CURRENT_EPOCH="$(date +%s)"
+MIN_VALID_UNTIL=$((CURRENT_EPOCH + 60))
+ACCESS_TOKEN=""
+EXPIRES_AT=0
+
+if [[ "$CACHE_ENABLED" -eq 1 && -f "$TOKEN_CACHE" ]]; then
+  CACHED_TOKEN="$(jq -r '.access_token // empty' "$TOKEN_CACHE" 2>/dev/null || true)"
+  CACHED_EXPIRY="$(jq -r '.expires_at_epoch // 0' "$TOKEN_CACHE" 2>/dev/null || echo 0)"
+  if [[ -n "$CACHED_TOKEN" && "$CACHED_EXPIRY" =~ ^[0-9]+$ && "$CACHED_EXPIRY" -gt "$MIN_VALID_UNTIL" ]]; then
+    ACCESS_TOKEN="$CACHED_TOKEN"
+    EXPIRES_AT="$CACHED_EXPIRY"
+  fi
+fi
+
+if [[ -z "$ACCESS_TOKEN" ]]; then
+  TMP_DIR="$(mktemp -d "$CACHE_DIR/gws-auth.XXXXXX")"
+  TOKEN_EXPORT="$TMP_DIR/gog-token.json"
+  cleanup() {
+    rm -f "$TOKEN_EXPORT"
+    rmdir "$TMP_DIR" 2>/dev/null || true
+  }
+  trap cleanup EXIT
+
+  export_gog_token() {
+    gog auth tokens export "$ACCOUNT" --out "$TOKEN_EXPORT" --overwrite >/dev/null 2>/dev/null
+  }
+
+  load_exported_access_token() {
+    local candidate expires_iso expiry_epoch
+    candidate="$(jq -r '.access_token // empty' "$TOKEN_EXPORT" 2>/dev/null || true)"
+    expires_iso="$(jq -r '.access_token_expires_at // empty' "$TOKEN_EXPORT" 2>/dev/null || true)"
+    expiry_epoch="$(python3 - "$expires_iso" <<'PY'
+from datetime import datetime
+import sys
+try:
+    print(int(datetime.fromisoformat(sys.argv[1].replace("Z", "+00:00")).timestamp()))
+except (ValueError, IndexError):
+    print(0)
+PY
+)"
+    if [[ -n "$candidate" && "$expiry_epoch" =~ ^[0-9]+$ && "$expiry_epoch" -gt "$MIN_VALID_UNTIL" ]]; then
+      ACCESS_TOKEN="$candidate"
+      EXPIRES_AT="$expiry_epoch"
+      return 0
+    fi
+    return 1
+  }
+
+  if ! export_gog_token; then
+    log "gws wrapper: failed to export gog token state for account $ACCOUNT"
+    exit 1
+  fi
+
+  if ! load_exported_access_token; then
+    # Let gog use its own keyring-held client secret to refresh, then export the
+    # resulting short-lived access token. This supports clients whose secret is
+    # intentionally absent from credentials.json.
+    gog auth doctor --json >/dev/null 2>&1 || true
+    export_gog_token || true
+    load_exported_access_token || true
+  fi
+
+  if [[ -z "$ACCESS_TOKEN" ]]; then
+    if [[ ! -f "$GOG_CLIENT_CREDENTIALS" ]]; then
+      log "gws wrapper: gog did not export a valid access token and client credentials are unavailable"
+      exit 1
+    fi
+
+    CLIENT_ID="$(jq -r '.client_id // empty' "$GOG_CLIENT_CREDENTIALS")"
+    CLIENT_SECRET="$(jq -r '.client_secret // empty' "$GOG_CLIENT_CREDENTIALS")"
+    REFRESH_TOKEN="$(jq -r '.refresh_token // empty' "$TOKEN_EXPORT")"
+    if [[ -z "$CLIENT_ID" || -z "$CLIENT_SECRET" || -z "$REFRESH_TOKEN" ]]; then
+      log "gws wrapper: gog did not export a valid access token; run 'gog auth doctor'"
+      exit 1
+    fi
+
+    TOKEN_RESPONSE="$(curl -sS https://oauth2.googleapis.com/token \
+      -d "client_id=$CLIENT_ID" \
+      -d "client_secret=$CLIENT_SECRET" \
+      -d "refresh_token=$REFRESH_TOKEN" \
+      -d "grant_type=refresh_token")"
+    ACCESS_TOKEN="$(printf '%s' "$TOKEN_RESPONSE" | jq -r '.access_token // empty')"
+    EXPIRES_IN="$(printf '%s' "$TOKEN_RESPONSE" | jq -r '.expires_in // 0')"
+    if [[ -z "$ACCESS_TOKEN" || ! "$EXPIRES_IN" =~ ^[0-9]+$ || "$EXPIRES_IN" -le 0 ]]; then
+      log "gws wrapper: failed to mint an access token from gog credentials"
+      exit 1
+    fi
+    EXPIRES_AT=$(( $(date +%s) + EXPIRES_IN ))
+  fi
+
+  if [[ "$CACHE_ENABLED" -eq 1 ]]; then
+    TMP_CACHE="$TOKEN_CACHE.tmp"
+    python3 - "$TMP_CACHE" "$ACCESS_TOKEN" "$EXPIRES_AT" <<'PY'
+import json, sys
+path, token, expires_at = sys.argv[1:4]
+with open(path, 'w', encoding='utf-8') as f:
+    json.dump({
+        'access_token': token,
+        'expires_at_epoch': int(expires_at)
+    }, f)
+    f.write('\n')
+PY
+    chmod 600 "$TMP_CACHE" 2>/dev/null || true
+    mv "$TMP_CACHE" "$TOKEN_CACHE"
+  fi
+fi
+
+exec env GOOGLE_WORKSPACE_CLI_TOKEN="$ACCESS_TOKEN" "$RAW_GWS_BIN" "${ARGS[@]}"

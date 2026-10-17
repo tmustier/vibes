@@ -1,0 +1,8 @@
+{
+  "googleworkspace_cli": {
+    "repo_url": "https://github.com/googleworkspace/cli.git",
+    "ref": "v0.22.5",
+    "commit": "705fb0ecac6f4249679958f6325b809b63fdde17",
+    "version": "0.22.5"
+  }
+}

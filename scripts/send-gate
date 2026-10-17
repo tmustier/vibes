@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+# send-gate — outbound email guardrail
+#
+# Wraps any command that sends an outbound email with:
+#   1. A preview of what will be sent
+#   2. A configurable grace period (default 60s) that can be aborted
+#
+# In pi: the grace period gives the user time to press ESC to abort.
+# In a terminal: Ctrl+C aborts during the countdown.
+#
+# Usage:
+#   send-gate gog gmail send --to "someone@example.com" --subject "Hi" --body "Hello"
+#   send-gate gog gmail reply --thread "abc123" --body "Thanks"
+#   SEND_GATE_GRACE=30 send-gate <any command>
+#
+# Environment:
+#   SEND_GATE_GRACE  — grace period in seconds (default: 60)
+
+set -euo pipefail
+
+GRACE_PERIOD="${SEND_GATE_GRACE:-60}"
+CMD=("$@")
+
+if [[ ${#CMD[@]} -eq 0 ]]; then
+  echo "Usage: send-gate <command> [args...]"
+  echo ""
+  echo "Wraps an outbound email command with a preview and"
+  echo "${GRACE_PERIOD}s grace period before executing."
+  echo ""
+  echo "Set SEND_GATE_GRACE=N to change the grace period (seconds)."
+  exit 1
+fi
+
+echo "══════════════════════════════════════════════════════"
+echo "📤  OUTBOUND EMAIL — REVIEW BEFORE SENDING"
+echo "══════════════════════════════════════════════════════"
+echo ""
+echo "Command:"
+echo "  ${CMD[*]}"
+echo ""
+
+# --- Preview ---
+# For gog commands, run with --dry-run to show what would be sent.
+# For other commands, just display the arguments.
+if [[ "${CMD[0]}" == "gog" ]]; then
+  echo "--- Preview (dry-run) -----------------------------------------"
+  # gog supports -n / --dry-run across subcommands
+  "${CMD[@]}" --dry-run 2>&1 || echo "(dry-run returned non-zero — preview may be incomplete)"
+  echo "-----------------------------------------------------------------"
+else
+  echo "--- Arguments ---"
+  for arg in "${CMD[@]}"; do
+    echo "  $arg"
+  done
+  echo "-----------------"
+fi
+
+echo ""
+echo "⏳ Will send in ${GRACE_PERIOD} seconds."
+echo "   Press Ctrl+C to abort (or ESC in pi to pause the agent)."
+echo ""
+
+# --- Countdown ---
+trap 'echo ""; echo "❌ ABORTED — nothing was sent."; exit 130' INT TERM
+
+for ((i=GRACE_PERIOD; i>0; i--)); do
+  printf "\r   ⏱  %02d seconds remaining...  " "$i"
+  sleep 1
+done
+
+printf "\r   🚀 Sending now...              \n"
+echo ""
+
+# --- Execute ---
+"${CMD[@]}"
+
+echo ""
+echo "✅ Sent successfully."

@@ -1,0 +1,13 @@
+---
+description: Set up or update a personal Pi environment
+---
+
+Set up this Mac from the checked-out `tmustier/vibes` package. Read `README.md`, `AGENTS.md`, `settings.template.json` and `profiles/home.vibes.json` first. Keep personal settings, credentials, packages and distinct skills; back up before changing existing configuration. Use `scripts/home-vibes`, not the managed `scripts/vibes update` path.
+
+- Use the bundled dependencies and the local clone at `~/projects/vibes`. On a fresh setup, install Node through nvm at `.node-version`, the pinned Pi version with its `piDependencyCutoff`, and `npm ci --omit=dev --ignore-scripts` in the clone. Preserve an existing Pi package entry for that clone and do not add a second Git-source entry. Adapt the template source to the actual clone. Merge the initial home feature map without overwriting existing choices. Preserve a configured `telemetryDestination`; if missing, write `null` (local-only). Preserve `vibesTelemetry: false`. Review duplicate resources using `docs/existing-setups.md`; back up settings and keep source files recoverable. Keep a separate copy when the user has chosen to maintain it and turn the corresponding bundled feature off.
+- Use the `openai-codex` and `anthropic` logins. Do not require an `openai` login. Preserve a working provider and test a real prompt with a tool call for each configured provider. Keep MCP configuration and credentials outside Git. Retain existing connectors unless the user asks to change them; `pi mcp list --json` connection state is not a model/tool test.
+- Preserve the user's `AGENTS.md`; `AGENTS.template.md` is an optional starting point, not a replacement policy. Apply web-search and subagent templates only where absent or where the existing value still matches an older template.
+- Install the home command independently of scheduling: create `~/.local/bin` if needed and link `~/.local/bin/vibes` to the clone's `scripts/home-vibes`. Review an existing collision first and keep its target recoverable. Ensure `~/.local/bin` is on PATH. Offer the nightly updater separately; if wanted, install the job with `scripts/home-install-job`. The updater fetches only this repository and never merges another source or pushes commits. It does not install refresh, hotfix or upload jobs. Run `vibes update`, `vibes check` and `vibes check ~` after migration.
+- For a Pi 1.0 migration, follow `docs/pi-1-migration-agent.md` with a genuine pre-upgrade baseline if one exists. Never manufacture one. Verify a real background subagent and an MCP tool through a model instead.
+
+Explain changes and unverified paths. Independently verify connector and Amp sign-in claims. If browser approval is needed, state the exact step for the user.

@@ -1,0 +1,40 @@
+import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { shouldCompact } from "@earendil-works/pi-coding-agent";
+
+const root = mkdtempSync(join(tmpdir(), "vibes-sol-context-"));
+const read = (p) => JSON.parse(readFileSync(p, "utf8"));
+const write = (p, value) => writeFileSync(p, JSON.stringify(value));
+try {
+  const previous = join(root, "previous");
+  const agent = join(root, "agent");
+  mkdirSync(previous); mkdirSync(agent);
+  const settings = read("settings.template.json");
+  const oldSettings = structuredClone(settings);
+  delete oldSettings.compaction.modelOverrides["openai-codex/gpt-6.1-sol"];
+  write(join(previous, "settings.template.json"), oldSettings);
+  write(join(agent, "settings.json"), oldSettings);
+  const unrelated = { providers: { anthropic: { modelOverrides: { custom: { contextWindow: 123456 } } }, "openai-codex": { modelOverrides: { "gpt-6.1-sol": { maxTokens: 8192 } } } } };
+  write(join(agent, "models.json"), unrelated);
+  const sync = () => execFileSync(process.execPath, ["scripts/sync-settings.mjs", previous, process.cwd(), agent]);
+  sync();
+  const models = read(join(agent, "models.json"));
+  assert.equal(models.providers["openai-codex"].modelOverrides["gpt-6.1-sol"].contextWindow, 500000);
+  assert.equal(models.providers["openai-codex"].modelOverrides["gpt-6.1-sol"].maxTokens, 8192);
+  assert.deepEqual(models.providers.anthropic, unrelated.providers.anthropic);
+  const compaction = read(join(agent, "settings.json")).compaction;
+  const reserveTokens = compaction.modelOverrides["openai-codex/gpt-6.1-sol"].reserveTokens;
+  assert.equal(reserveTokens, 50000);
+  const resolved = { enabled: true, keepRecentTokens: 20000, reserveTokens };
+  assert.equal(shouldCompact(450000, 500000, resolved), false);
+  assert.equal(shouldCompact(450001, 500000, resolved), true);
+  assert.equal(shouldCompact(280000, 500000, resolved), false);
+  models.providers["openai-codex"].modelOverrides["gpt-6.1-sol"].contextWindow = 700000;
+  write(join(agent, "models.json"), models);
+  sync();
+  assert.equal(read(join(agent, "models.json")).providers["openai-codex"].modelOverrides["gpt-6.1-sol"].contextWindow, 700000);
+  console.log("Sol context migration, user overrides and real Pi compaction boundary: ok");
+} finally { rmSync(root, { recursive: true, force: true }); }

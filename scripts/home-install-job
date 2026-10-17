@@ -1,0 +1,31 @@
+#!/bin/bash
+set -euo pipefail
+repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+mkdir -p "$HOME/.local/bin" "$HOME/Library/LaunchAgents" "$HOME/Library/Logs"
+link="$HOME/.local/bin/vibes"
+if [ -e "$link" ] || [ -L "$link" ]; then
+  [ "$(readlink "$link")" = "$repo/scripts/home-vibes" ] || {
+    echo "Review and move the existing $link before installing the home command." >&2
+    exit 1
+  }
+else
+  ln -s "$repo/scripts/home-vibes" "$link"
+fi
+plist="$HOME/Library/LaunchAgents/ai.personal.pi-update.plist"
+if [ -e "$plist" ]; then cp -p "$plist" "$plist.backup.$(date +%Y%m%d-%H%M%S)"; fi
+cat >"$plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>Label</key><string>ai.personal.pi-update</string>
+<key>ProgramArguments</key><array><string>$repo/scripts/home-update</string></array>
+<!-- agent-default (not a user rule): 2026-10-02, update at 04:04 local time. -->
+<key>StartCalendarInterval</key><dict><key>Hour</key><integer>4</integer><key>Minute</key><integer>4</integer></dict>
+<key>StandardOutPath</key><string>$HOME/Library/Logs/pi-personal-update.log</string>
+<key>StandardErrorPath</key><string>$HOME/Library/Logs/pi-personal-update.log</string>
+</dict></plist>
+EOF
+plutil -lint "$plist"
+launchctl bootout "gui/$(id -u)/ai.personal.pi-update" >/dev/null 2>&1 || true
+launchctl bootstrap "gui/$(id -u)" "$plist"
+echo "Home update installed: $link; nightly job ai.personal.pi-update"

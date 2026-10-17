@@ -1,0 +1,219 @@
+#!/usr/bin/env python3
+"""Build the setup inventory, redacting personal text before showing or uploading it.
+
+    inventory show <raw.json>   print exactly what would be sent
+    inventory send <raw.json>   upload to people/<identity>.json at telemetryDestination
+    inventory report <session.jsonl> <summary>
+                                append a report on a fixed update to reports/<identity>.md
+
+Package files are fingerprinted; personal files include text. Setting "vibesTelemetry": false
+in settings.json stops uploads. extensions/inventory.ts supplies the raw startup report.
+"""
+
+from __future__ import annotations
+
+import difflib
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+VIBES = Path(__file__).resolve().parents[1]
+MAX_TEXT_CHARS = 20_000  # agent-default (not a user rule): 2026-09-28
+PACKAGE_SOURCE_RE = re.compile(r"^(npm:|git:|git@|https?://|ssh://)")
+HOME = str(Path.home())
+
+sys.path.insert(0, str(VIBES / "lib"))
+from telemetry_destination import destination
+
+loader = importlib.machinery.SourceFileLoader("papercut", str(VIBES / "scripts" / "papercut"))
+PAPERCUT = importlib.util.module_from_spec(importlib.util.spec_from_loader("papercut", loader))
+sys.modules["papercut"] = PAPERCUT
+loader.exec_module(PAPERCUT)
+
+
+def scrub(value):
+    if isinstance(value, list):
+        return [scrub(item) for item in value]
+    if isinstance(value, dict):
+        return {key: scrub(item) for key, item in value.items()}
+    if not isinstance(value, str):
+        return value
+
+    text = value.replace(HOME + "/", "~/")
+    for label, pattern in PAPERCUT.SECRET_PATTERNS:
+        text = pattern.sub(f"[redacted {label}]", text)
+
+    def assignment(match: re.Match[str]) -> str:
+        value = match.group("value")
+        if value.strip().lower() in PAPERCUT.SAFE_PLACEHOLDERS:
+            return match.group(0)
+        return match.group(0).replace(value, "[redacted credential]")
+
+    text = PAPERCUT.CREDENTIAL_ASSIGNMENT_RE.sub(assignment, text)
+    text = PAPERCUT.EMAIL_RE.sub("[redacted email]", text)
+
+    return PAPERCUT.CARD_RE.sub("[redacted number]", text)
+
+
+def read_json(path: Path) -> dict:
+    return json.loads(path.read_text()) if path.is_file() else {}
+
+
+class Locator:
+    def __init__(self, packages: list[dict]):
+        roots = [(os.path.realpath(VIBES), "Vibes")]
+        for package in packages:
+            if package.get("installedPath") and PACKAGE_SOURCE_RE.match(package["source"]):
+                roots.append((os.path.realpath(package["installedPath"]), package["source"]))
+        self.roots = sorted(roots, key=lambda root: -len(root[0]))
+
+    def describe(self, path: str) -> dict:
+        real = os.path.realpath(path)
+        for root, source in self.roots:
+            if real.startswith(root + os.sep):
+                inside = os.path.relpath(real, root)
+                bundled = re.match(r"node_modules/((?:@[^/]+/)?[^/]+)/(.*)", inside) if source == "Vibes" else None
+                if bundled:
+                    return {"from": f"Vibes ({bundled.group(1)})", "path": bundled.group(2)}
+                return {"from": source, "path": inside}
+        return {"from": "personal", "path": path}
+
+
+def resources(entries: list[dict], locator: Locator, keep: tuple[str, ...]) -> list[dict]:
+    shaped = []
+    for entry in entries:
+        item = {**{key: entry[key] for key in keep if entry.get(key) is not None}, **locator.describe(entry["path"])}
+        file = Path(entry["path"])
+        if file.is_file():
+            data = file.read_bytes()
+            item["sha256"] = hashlib.sha256(data).hexdigest()[:16]
+            if item["from"] == "personal":
+                text = scrub(data.decode("utf-8", errors="replace"))
+                item["text"] = text[:MAX_TEXT_CHARS]
+                if len(text) > MAX_TEXT_CHARS:
+                    item["text"] += f"\n[… cut at {MAX_TEXT_CHARS} of {len(text)} characters]"
+        shaped.append(item)
+    return shaped
+
+
+def git(*args: str) -> str | None:
+    result = subprocess.run(["git", "-C", str(VIBES), *args], capture_output=True, text=True)
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def main(argv: list[str]) -> int:
+    if not (len(argv) == 2 and argv[0] in ("show", "send") or len(argv) == 3 and argv[0] == "report"):
+        print(__doc__)
+        return 2
+    agent = Path(os.environ.get("PI_CODING_AGENT_DIR") or Path.home() / ".pi" / "agent")
+    settings = read_json(agent / "settings.json")
+    if argv[0] != "show":
+        try:
+            uploader = destination(VIBES, agent)
+        except ValueError as error:
+            print(f"Not sent: {error}.")
+            return 1
+        if uploader is None:
+            print("Not sent: no telemetry destination configured (local-only or disabled).")
+            return 0
+        if argv[0] == "report":
+            session, summary = argv[1:]
+            stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            entry = scrub(f"## {stamp} (Vibes {git('rev-parse', '--short', 'HEAD') or 'unknown'})\n\nSession: {session}\n\n{summary.strip()}\n\n")
+            return uploader.upload(f"reports/{uploader.identity}.md", lambda existing: (existing or f"# {uploader.identity}: update fixes\n\n") + entry)
+    raw_text = Path(argv[1]).read_text()
+    if not raw_text.strip():
+        print("Pi did not write the inventory. Run `vibes check` to see whether it starts.")
+        return 1
+    raw = json.loads(raw_text)
+    if "error" in raw:
+        raise SystemExit(f"Pi could not collect the inventory:\n{raw['error']}")
+    template = read_json(VIBES / "settings.template.json")
+    locator = Locator(raw["packages"])
+    entries = {(entry if isinstance(entry, str) else entry["source"]): entry for entry in settings.get("packages", [])}
+    packages = []
+    for package in raw["packages"]:
+        entry = entries.get(package["source"])
+        filters = {key: value for key, value in entry.items() if key != "source"} if isinstance(entry, dict) else {}
+        packages.append({"source": package["source"], "scope": package["scope"], "version": package.get("version"), **({"filters": filters} if filters else {})})
+
+    agents = agent / "AGENTS.md"
+    agents_diff = None
+    if agents.is_file():
+        agents_diff = "".join(difflib.unified_diff(
+            (VIBES / "AGENTS.template.md").read_text().splitlines(keepends=True),
+            agents.read_text().splitlines(keepends=True),
+            "team template", "their AGENTS.md",
+        ))
+
+    wrappers = {os.path.realpath(entry["path"]): entry["bundles"]["package"] for entry in raw["extensions"] if "bundles" in entry}
+
+    def origin(item: dict) -> str:
+        if not item.get("path", "").startswith("/"):
+            return item["source"]
+        wrapped = wrappers.get(os.path.realpath(item["path"]))
+        return f"Vibes ({wrapped})" if wrapped else locator.describe(item["path"])["from"]
+
+    last_update = read_json(agent / "vibes-update.json")
+    inventory = scrub({
+        "schema": 1,
+        "generatedAt": raw["generatedAt"],
+        "pi": raw["pi"],
+        "vibes": {
+            "commit": git("rev-parse", "--short", "HEAD"),
+            "branch": git("rev-parse", "--abbrev-ref", "HEAD"),
+            "lastUpdate": {
+                "finishedAt": last_update.get("finishedAt"),
+                "ok": last_update.get("ok"),
+                "failed": [step["name"] for step in last_update.get("steps", []) if not step["ok"]],
+            } if last_update else None,
+        },
+        "model": raw["model"],
+        "thinking": raw["thinking"],
+        "providers": sorted(read_json(agent / "auth.json")),
+        "mcpServers": sorted(read_json(agent / "mcp.json").get("mcpServers", {})),
+        "telemetry": settings.get("vibesTelemetry", True),
+        "customisedSettings": {
+            key: {"theirs": settings.get(key), "team": value}
+            for key, value in template.items()
+            if key != "packages" and settings.get(key) != value
+        },
+        "agentsDiff": agents_diff,
+        "packages": packages,
+        "extensions": resources(raw["extensions"], locator, ("enabled", "scope", "bundles")),
+        "skills": resources(raw["skills"], locator, ("name", "enabled", "loaded", "inContext", "indexTokens")),
+        "prompts": resources(raw["prompts"], locator, ("enabled",)),
+        "themes": resources(raw["themes"], locator, ("enabled",)),
+        "tools": [
+            {**{key: tool[key] for key in ("name", "active", "tokens") if tool.get(key) is not None}, "from": origin(tool)}
+            for tool in raw["tools"]
+        ],
+        "commands": [{"name": command["name"], "kind": command["kind"], "from": origin(command)} for command in raw["commands"]],
+        "context": raw["context"],
+    })
+    body = json.dumps(inventory, indent=2) + "\n"
+    if argv[0] == "show":
+        print(body, end="")
+        return 0
+
+    def render(existing: str | None) -> str | None:
+        if existing is not None:
+            previous = json.loads(existing)
+            previous["generatedAt"] = inventory["generatedAt"]
+            if previous["vibes"]["lastUpdate"] and inventory["vibes"]["lastUpdate"]:
+                previous["vibes"]["lastUpdate"]["finishedAt"] = inventory["vibes"]["lastUpdate"]["finishedAt"]
+            if previous == inventory:
+                return None
+        return body
+
+    return uploader.upload(f"people/{uploader.identity}.json", render)
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

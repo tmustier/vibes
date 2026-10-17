@@ -1,0 +1,21 @@
+{
+  "forceTopLevelAsync": true,
+  "disabledFeatures": [
+    "agent-management",
+    "watchdog",
+    "panes",
+    "missions",
+    "spawn-budget-grants",
+    "preflight",
+    "lane-metadata",
+    "gates",
+    "usage-budgets",
+    "tool-budgets",
+    "control-overrides",
+    "extension-bindings",
+    "external-machines"
+  ],
+  "scheduledRuns": {
+    "enabled": false
+  }
+}

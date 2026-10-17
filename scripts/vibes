@@ -1,0 +1,907 @@
+#!/bin/bash
+# vibes: keep this Mac on the team's Pi setup.
+#
+#   vibes update   Homebrew formulae, nvm, Node (.node-version), npm, the Vibes packages, the team's
+#                  model, compaction and subagent settings, the pinned Pi version, and
+#                  startup checks. The home command uses scripts/home-update instead. Packages the user
+#                  installed themselves, and settings they changed, are left alone. Ends with `vibes check`,
+#                  then sends the setup inventory only to an explicitly configured destination. On the first Pi 1.0
+#                  update, a real Pi agent verifies MCP migration and repairs login if needed.
+#   vibes check [dir]
+#                  Start Pi in a hidden tmux session in dir (default: an empty folder) and report the startup
+#                  problems Pi shows: skill, prompt and theme conflicts, extension issues, load errors.
+#   vibes inventory
+#                  Print the setup inventory exactly as `vibes update` sends it: what Pi loads and what is
+#                  switched on, the context breakdown, and the text of the user's own skills, prompts and
+#                  extensions, with credentials removed (scripts/inventory).
+#   vibes status   Show the result of the last update.
+#   vibes features [migrate [--apply] [--source <source>]]
+#                  List personal feature choices, or explicitly migrate exact wrapper opt-outs with backups.
+#   vibes hotfix <what it fixes>
+#                  Maintainers: ship Vibes main to every laptop within the hour instead of at night. Tags
+#                  main (CI must have passed) as hotfix-<UTC time>, with the message as the tag's note.
+#   vibes hotfix-check
+#                  launchd runs this hourly. When a new hotfix tag exists, it updates the Vibes packages,
+#                  the settings and the pinned Pi, then runs `vibes check`: the nightly update without
+#                  Homebrew, Node, npm, the commercial workspace or telemetry. It waits while Pi is
+#                  running if the hotfix moves Pi to another version. Does nothing otherwise.
+#   vibes report <session.jsonl> <summary>
+#                  Append a short report on fixing a failed update, with the fixing session's file, to
+#                  reports/<github-login>.md at the configured destination (scripts/inventory).
+#
+# Generic repository reconciliation helpers below are retained for explicit callers and tests.
+# Updates do not invoke them on another workspace.
+# Each update records its result in ~/.pi/agent/vibes-update.json; the update-status extension
+# reports failures when Pi starts, and failures also raise a macOS notification.
+#
+# The code runs inside functions, so bash has parsed the whole file before `pi update`
+# replaces it during a run.
+
+VIBES="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+AGENT_DIR="${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}"
+STATUS_FILE="$AGENT_DIR/vibes-update.json"
+NOTES_FILE="$AGENT_DIR/vibes-update-notes" # one per line, until write_status takes them
+LOCK_FILE="$AGENT_DIR/vibes-update.flock"
+LOG_FILE="$HOME/Library/Logs/pi-update.log"
+HOTFIX_FILE="$AGENT_DIR/vibes-hotfix" # the last hotfix tag this Mac has
+HOTFIX_LABEL=ai.vibes.pi-hotfix
+HOTFIX_INTERVAL_SECONDS=3600 # agent-default (not a user rule): 2026-09-29
+REFRESH_LABEL=ai.vibes.pi-refresh
+REFRESH_INTERVAL_SECONDS=3600 # agent-default (not a user rule): 2026-10-14
+LAUNCH_AGENTS="$HOME/Library/LaunchAgents"
+VIBES_REPO=tmustier/vibes
+AGENT_TIMEOUT_SECONDS=1800 # agent-default (not a user rule): 2026-09-28
+CHECK_TIMEOUT_SECONDS=120 # agent-default (not a user rule): 2026-09-28
+AGENT_MODEL="openai-codex/gpt-6.1-sol:medium" # Preserve the selected provider route below.
+PI_1_MARKER="${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}/vibes-pi-1.0.0-verified.json"
+MCP_BEFORE="${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}/vibes-pi-1.0.0-mcp-before.json"
+
+RESULTS=()
+
+
+record() { RESULTS+=("$1"$'\t'"$2"$'\t'"$3"); }
+# Something the user should hear about once, when Pi next starts. Written straight away, so an
+# interrupted run doesn't lose it.
+note() {
+	mkdir -p "$(dirname "$NOTES_FILE")" && printf '%s\n' "$1" >>"$NOTES_FILE"
+	echo "--- $1"
+}
+
+step() {
+	local name=$1
+	shift
+	echo "--- $name"
+	if "$@"; then record "$name" ok ""; else record "$name" fail "exit $?"; fi
+}
+
+# The formulae bundled defaults need: files-widget (/readfiles) warns on every start without them.
+update_brew() {
+	command -v brew >/dev/null || return 0
+	brew update && brew upgrade --formula && brew install --formula --quiet bat git-delta glow
+}
+
+update_nvm() {
+	[ -d "$NVM_DIR/.git" ] || { echo "nvm isn't installed in $NVM_DIR; /onboard sets it up"; return 1; }
+	git -C "$NVM_DIR" fetch --quiet --tags origin || return 1
+	local latest
+	latest=$(git -C "$NVM_DIR" describe --abbrev=0 --tags --match "v[0-9]*" "$(git -C "$NVM_DIR" rev-list --tags --max-count=1)") || return 1
+	git -C "$NVM_DIR" -c advice.detachedHead=false checkout --quiet "$latest"
+}
+
+load_nvm() {
+	[ -s "$NVM_DIR/nvm.sh" ] || return 0
+	# shellcheck source=/dev/null
+	. "$NVM_DIR/nvm.sh" --no-use
+	nvm use --silent default >/dev/null 2>&1 || true
+}
+
+# Latest patch of the team's Node major. Global packages move with it.
+update_node() {
+	command -v nvm >/dev/null || { echo "nvm isn't available, so Node can't be kept at the team's version"; return 1; }
+	local major latest current
+	major=$(tr -d '[:space:]v' <"$VIBES/.node-version")
+	latest=$(nvm version-remote "$major") || return 1
+	current=$(nvm version default)
+	if [ "$latest" != "$current" ]; then
+		if [ "$current" = "N/A" ]; then
+			nvm install "$major" || return 1
+		else
+			nvm install "$major" --reinstall-packages-from="$current" || return 1
+		fi
+	fi
+	nvm alias default "$major" >/dev/null && nvm use --silent default || return 1
+	[ "$(node -p 'process.versions.node.split(".")[0]')" = "$major" ] || { echo "node is $(node -v), not Node $major"; return 1; }
+}
+
+# The first pi on PATH that is the Pi package itself, not a wrapper script around it.
+pi_bin() {
+	local bin
+	while IFS= read -r bin; do
+		case "$(readlink -f "$bin")" in */@earendil-works/pi-coding-agent/*) echo "$bin" && return 0 ;; esac
+	done < <(type -ap pi)
+	return 1
+}
+
+# Only the packages Vibes installs (settings.template.json), in whatever form the user's settings
+# name them (for example with an @branch). Never the user's own packages.
+update_vibes_packages() {
+	local pi sources source failed=0
+	pi=$(pi_bin) || { echo "Pi isn't installed"; return 1; }
+	sources=$(node "$VIBES/lib/vibes-sources.mjs" "$pi" "$VIBES/settings.template.json") || return 1
+	while IFS= read -r source; do
+		[ -n "$source" ] || continue
+		(cd "$HOME" && "$pi" update --extension "$source") || failed=1
+	done <<<"$sources"
+	return $failed
+}
+
+# Pi skips dependency installation when the Vibes Git commit hasn't changed, and npm otherwise
+# uses the checked-in lock snapshot. Refresh only the two owned rolling defaults explicitly.
+# --no-save keeps both manifests intact; leave the lock enabled for every other dependency.
+refresh_rolling_packages() {
+	(cd "$VIBES" && npm install --no-save --omit=dev codex-computer-use-mcp@latest @tmustier/pi-session-hud@latest)
+}
+
+pinned_pi() { node -p "require('$VIBES/package.json').devDependencies['@earendil-works/pi-coding-agent']"; }
+
+# The Pi version Vibes pins, installed wherever Pi already lives. Freeze dependency resolution
+# at the tested cutoff, not Pi's publish time (its dependencies can be published minutes later).
+install_pinned_pi() {
+	local pinned before bin
+	pinned=$(pinned_pi) || return 1
+	before=$(node -p "require('$VIBES/package.json').piDependencyCutoff") || return 1
+	if bin=$(pi_bin); then
+		[ "$("$bin" --version)" = "$pinned" ] && return 0
+		npm install -g --prefix "$(cd "$(dirname "$bin")/.." && pwd)" --before "$before" "@earendil-works/pi-coding-agent@$pinned" || return 1
+	else
+		npm install -g --before "$before" "@earendil-works/pi-coding-agent@$pinned" || return 1
+		bin=$(pi_bin) || return 1
+	fi
+	[ "$("$bin" --version)" = "$pinned" ]
+}
+
+# The first update to the Pi 1.0 pin runs a Pi agent that checks the MCP migration and repairs
+# sign-ins, and writes the marker only once scripts/verify-pi-1-migration.mjs accepts the run. The
+# MCP servers connected before Pi moved are the baseline; a retry keeps the original one. `mcp list`
+# exits 1 when any server needs sign-in, with complete JSON.
+pi_1_migration_needed() { [ ! -f "$PI_1_MARKER" ] && [ "$(pinned_pi)" = 1.0.0 ]; }
+
+capture_pi_1_baseline() {
+	[ -s "$MCP_BEFORE" ] && return 0
+	"$(pi_bin)" mcp list --json >"$MCP_BEFORE" 2>/dev/null
+	[ -s "$MCP_BEFORE" ]
+}
+
+run_pi_1_migration() {
+	[ "$("$(pi_bin)" --version)" = 1.0.0 ] || { echo "Pi 1.0.0 is not installed"; return 1; }
+	local run prompt
+	run=$(mktemp -d "${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}/vibes-pi-1-XXXXXX") || return 1
+	prompt="$(<"$VIBES/docs/pi-1-migration-agent.md")
+
+Pre-upgrade \`pi mcp list --json\` output: $MCP_BEFORE
+Subagent proof file: $run/subagent-proof.txt"
+	echo "--- starting a Pi 1.0 migration agent; private record: $run"
+	(cd "$run" && perl -e 'alarm shift; exec @ARGV' "$AGENT_TIMEOUT_SECONDS" "$(pi_bin)" --mode json --session-dir "$run/sessions" -p "$prompt" >"$run/events.jsonl" 2>"$run/stderr.log") || return 1
+	"$(pi_bin)" mcp list --json >"$run/after.json" 2>/dev/null
+	node "$VIBES/scripts/verify-pi-1-migration.mjs" "$MCP_BEFORE" "$run/after.json" "$run/events.jsonl" "$PI_1_MARKER" "$run/subagent-proof.txt" && rm -f "$MCP_BEFORE"
+}
+
+# Settings the team's templates set, against the templates as they were before the packages updated.
+sync_settings() {
+	node "$VIBES/scripts/sync-settings.mjs" "$1" "$VIBES" "${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}"
+}
+
+# The newest hotfix tag on the Vibes repo (tags sort by their UTC time), or nothing.
+latest_hotfix() {
+	git -C "$VIBES" ls-remote --tags --refs origin 'refs/tags/hotfix-*' | awk '{ sub("refs/tags/", "", $2); print $2 }' | sort | tail -1
+}
+
+# Whether a Pi session is running (Pi names its process `pi`).
+pi_running() { pgrep -x pi >/dev/null; }
+
+# The hourly launchd job that runs `vibes hotfix-check`. Rewritten and reloaded only when it changed.
+install_hotfix_job() {
+	local plist="$LAUNCH_AGENTS/$HOTFIX_LABEL.plist" new
+	new=$(cat <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>$HOTFIX_LABEL</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>$HOME/.local/bin/vibes</string>
+		<string>hotfix-check</string>
+	</array>
+	<key>StartInterval</key>
+	<integer>$HOTFIX_INTERVAL_SECONDS</integer>
+	<key>StandardOutPath</key>
+	<string>$LOG_FILE</string>
+	<key>StandardErrorPath</key>
+	<string>$LOG_FILE</string>
+</dict>
+</plist>
+EOF
+)
+	if [ "$(cat "$plist" 2>/dev/null)" = "$new" ] && launchctl print "gui/$(id -u)/$HOTFIX_LABEL" >/dev/null 2>&1; then return 0; fi
+	mkdir -p "$LAUNCH_AGENTS" && printf '%s\n' "$new" >"$plist" || return 1
+	launchctl bootout "gui/$(id -u)/$HOTFIX_LABEL" >/dev/null 2>&1
+	launchctl bootstrap "gui/$(id -u)" "$plist"
+}
+
+# The calendar job catches sleep; this companion catches shutdown/login and upload failures.
+# It shares the same lock, so a wake/login tick never races a nightly update or hotfix.
+install_refresh_job() {
+	local plist="$LAUNCH_AGENTS/$REFRESH_LABEL.plist" new loaded=""
+	new=$(python3 - "$HOME/.local/bin/vibes" "$LOG_FILE" "$REFRESH_LABEL" "$REFRESH_INTERVAL_SECONDS" <<'PY'
+import plistlib, sys
+command, log, label, interval = sys.argv[1:]
+print(plistlib.dumps({"Label": label, "ProgramArguments": [command, "refresh"],
+    "RunAtLoad": True, "StartInterval": int(interval),
+    "StandardOutPath": log, "StandardErrorPath": log}).decode(), end="")
+PY
+) || return 1
+	launchctl print "gui/$(id -u)/$REFRESH_LABEL" >/dev/null 2>&1 && loaded=1
+	[ "$(cat "$plist" 2>/dev/null)" != "$new" ] || [ -z "$loaded" ] || return 0
+	# Never boot out the job that owns this update; a later calendar/manual update can reload it.
+	# Leave its old plist too, so that later run still detects the change.
+	if [ -n "$loaded" ] && [ -n "${VIBES_REFRESH_JOB:-}" ]; then return 0; fi
+	mkdir -p "$LAUNCH_AGENTS" && printf '%s\n' "$new" >"$plist" || return 1
+	[ -z "$loaded" ] || launchctl bootout "gui/$(id -u)/$REFRESH_LABEL" >/dev/null 2>&1
+	launchctl bootstrap "gui/$(id -u)" "$plist"
+}
+
+cmd_refresh() {
+	if [ -z "${VIBES_UPDATE_LOCKED:-}" ]; then
+		mkdir -p "$(dirname "$LOCK_FILE")"
+		export VIBES_UPDATE_LOCKED=1
+		with_lock "$VIBES/scripts/vibes" refresh
+	fi
+	export NVM_DIR="$HOME/.nvm"
+	export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+	export VIBES_REFRESH_JOB=1
+	load_nvm
+	log_output
+	python3 "$VIBES/scripts/refresh" run
+}
+
+cmd_hotfix_check() {
+	export NVM_DIR="$HOME/.nvm"
+	export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+	load_nvm
+	# Hourly and usually nothing to do: stay quiet, including offline.
+	local tag
+	tag=$(latest_hotfix 2>/dev/null)
+	[ -n "$tag" ] && [ "$tag" != "$(cat "$HOTFIX_FILE" 2>/dev/null)" ] || return 0
+	if [ -z "${VIBES_UPDATE_LOCKED:-}" ]; then
+		mkdir -p "$(dirname "$LOCK_FILE")"
+		export VIBES_UPDATE_LOCKED=1
+		with_lock "$VIBES/scripts/vibes" hotfix-check
+	fi
+	log_output
+	echo "=== $(date '+%Y-%m-%d %H:%M:%S') vibes hotfix $tag"
+	git -C "$VIBES" fetch --quiet origin "refs/tags/$tag:refs/tags/$tag" || { echo "could not fetch $tag"; return 1; }
+	local message pinned current waiting="$HOME/.pi/agent/vibes-hotfix-waiting"
+	message=$(git -C "$VIBES" tag -l --format='%(contents:subject)' "$tag")
+	# Replacing Pi under a running session can break it: a hotfix that moves Pi waits until Pi is closed.
+	pinned=$(git -C "$VIBES" show "$tag:package.json" | node -e 'console.log(JSON.parse(require("node:fs").readFileSync(0, "utf8")).devDependencies["@earendil-works/pi-coding-agent"])') || return 1
+	current=$("$(pi_bin)" --version 2>/dev/null)
+	if [ "$pinned" != "$current" ] && pi_running; then
+		echo "--- this hotfix moves Pi to $pinned; it waits until Pi is closed (checked hourly)"
+		if [ "$(cat "$waiting" 2>/dev/null)" != "$tag" ]; then
+			echo "$tag" >"$waiting"
+			osascript -e "display notification \"Quit Pi to install it: ${message//\"/}\" with title \"Vibes hotfix waiting\"" >/dev/null 2>&1
+		fi
+		return 0
+	fi
+	local previous
+	previous=$(mktemp -d)
+	cp "$VIBES/settings.template.json" "$VIBES/subagent-config.template.json" "$VIBES/web-search.template.json" "$previous/" 2>/dev/null
+	[ ! -f "$VIBES/models.template.json" ] || cp "$VIBES/models.template.json" "$previous/"
+	step packages update_vibes_packages
+	step rolling-packages refresh_rolling_packages
+	step settings sync_settings "$previous"
+	rm -rf "$previous"
+	! pi_1_migration_needed || step mcp-before capture_pi_1_baseline
+	step pi install_pinned_pi
+	step startup cmd_check
+	! pi_1_migration_needed || step pi-1-migration run_pi_1_migration
+	local failed=() row
+	for row in "${RESULTS[@]}"; do
+		[ "$(cut -f2 <<<"$row")" = ok ] || failed+=("$(cut -f1 <<<"$row")")
+	done
+	if [ ${#failed[@]} -eq 0 ]; then
+		echo "$tag" >"$HOTFIX_FILE"
+		rm -f "$waiting"
+		note "A Vibes hotfix was installed: $message. Restart Pi, or /reload, to use it."
+		write_status true
+		osascript -e "display notification \"${message//\"/}. Restart Pi, or /reload, to use it.\" with title \"Vibes hotfix installed\"" >/dev/null 2>&1
+	else
+		write_status false
+		osascript -e "display notification \"Failed: ${failed[*]}. See ~/Library/Logs/pi-update.log\" with title \"Vibes hotfix\"" >/dev/null 2>&1
+	fi
+	echo "=== done (${#failed[@]} failed${failed[*]:+: ${failed[*]}})"
+	[ ${#failed[@]} -eq 0 ]
+}
+
+# Maintainers: tag Vibes main as a hotfix, once CI has passed on it.
+cmd_hotfix() {
+	local message=$1 sha subject checks tag object answer
+	[ -n "$message" ] || { echo 'usage: vibes hotfix "<what it fixes>"'; return 2; }
+	sha=$(gh api "repos/$VIBES_REPO/commits/main" --jq .sha) && subject=$(gh api "repos/$VIBES_REPO/commits/$sha" --jq '.commit.message | split("\n")[0]') || return 1
+	checks=$(gh api "repos/$VIBES_REPO/commits/$sha/check-runs" --jq '[.check_runs[] | "\(.name): \(.conclusion // .status)"] | join(", ")') || return 1
+	if [ -z "$checks" ] || grep -qv ': success$' <<<"${checks//, /$'\n'}"; then
+		echo "CI hasn't passed on main (${sha:0:12}): ${checks:-no checks yet}. Wait for it, then try again."
+		return 1
+	fi
+	if [ -t 0 ]; then
+		read -r -p "Ship main (${sha:0:12} $subject) to every laptop within the hour? [y/N] " answer
+		[ "$answer" = y ] || [ "$answer" = Y ] || { echo "Not shipped."; return 1; }
+	fi
+	tag="hotfix-$(date -u +%Y%m%d-%H%M%S)"
+	object=$(gh api "repos/$VIBES_REPO/git/tags" -f tag="$tag" -f message="$message" -f object="$sha" -f type=commit --jq .sha) &&
+		gh api "repos/$VIBES_REPO/git/refs" -f ref="refs/tags/$tag" -f sha="$object" >/dev/null || return 1
+	echo "Shipped $tag (main at ${sha:0:12}). Laptops install it within the hour; one that moves Pi waits until Pi is closed."
+}
+
+# Bring a repo's checked-out branch up to date with its upstream. It fast-forwards when that can't
+# touch local work. Otherwise it saves the local work (commits, index, and working tree, including
+# untracked files and ignored files a fast-forward would overwrite) to a backup ref, resets the branch
+# to upstream, and puts back the uncommitted changes git can merge with upstream, staged as they were.
+# Local commits, and uncommitted changes that conflict with upstream, go to an agent (resolve_backup).
+update_repo() {
+	local dir=$1 output exposed status snapshot
+	[ -d "$dir/.git" ] || return 0
+	git -C "$dir" fetch --quiet || return 1
+	exposed=$(mktemp) || return 1
+	exposed_ignored_files "$dir" >"$exposed" || { rm -f "$exposed"; return 1; }
+	if [ -s "$exposed" ]; then
+		echo "These ignored local files could be overwritten or deleted by a fast-forward:"
+		tr '\0' '\n' <"$exposed"
+	elif output=$(git -C "$dir" merge --ff-only '@{u}' 2>&1); then
+		echo "$output"
+		rm -f "$exposed"
+		resolve_backups "$dir"
+		return
+	else
+		echo "$output"
+	fi
+	snapshot=$(snapshot_local_work "$dir" "$exposed")
+	status=$?
+	[ $status -eq 0 ] && update_checkout "$dir" "$snapshot" "$exposed"
+	status=$?
+	rm -f "$exposed"
+	[ $status -eq 0 ] || return 1
+	resolve_backups "$dir"
+}
+
+# Moves the checkout to upstream, keeping the uncommitted changes in the snapshot that merge cleanly.
+# The snapshot is saved first: under refs/vibes/resolved/ when the checkout keeps all of the local
+# work, otherwise under refs/vibes/backup-* for resolve_backup, with a message saying what's left.
+update_checkout() {
+	local dir=$1 snapshot=$2 exposed=$3 head upstream branch dropped dropped_index tree index_tree attempt t i commits msg backup left='' kept now status
+	head=$(git -C "$dir" rev-parse HEAD) && upstream=$(git -C "$dir" rev-parse '@{u}') && branch=$(git -C "$dir" symbolic-ref --short HEAD) || return 1
+	dropped=$(mktemp) && dropped_index=$(mktemp) || return 1
+	# Leave out changes to the paths that conflict until what's left merges cleanly (the working
+	# tree and the index separately).
+	for attempt in 1 2 3; do
+		tree=$(merge_onto_upstream "$dir" "$head" "$upstream" "$snapshot" "$dropped")
+		t=$?
+		index_tree=$(merge_onto_upstream "$dir" "$head" "$upstream" "$snapshot^2" "$dropped_index")
+		i=$?
+		[ $t -le 1 ] && [ $i -le 1 ] || { rm -f "$dropped" "$dropped_index"; return 1; }
+		[ $t -eq 0 ] && [ $i -eq 0 ] && break
+		tree=
+	done
+	if [ -z "$tree" ]; then
+		tree=$(git -C "$dir" rev-parse "$upstream^{tree}") && index_tree=$tree || { rm -f "$dropped" "$dropped_index"; return 1; }
+		git -C "$dir" diff -z --name-only --no-renames "$head" "$snapshot" >"$dropped"
+		git -C "$dir" diff -z --name-only --no-renames "$head" "$snapshot^2" >"$dropped_index"
+	fi
+	cat "$dropped_index" >>"$dropped"
+	rm -f "$dropped_index"
+	commits=$(git -C "$dir" log --format='  %h %s' "$upstream..$head")
+	msg="vibes update: local work saved before moving $branch to upstream ${upstream:0:12}"
+	[ -z "$commits" ] || msg+=$'\n\n'"Local commits not on upstream (not in the checkout):"$'\n'"$commits"
+	[ -z "$commits" ] || left=1
+	[ ! -s "$dropped" ] || left=1
+	[ ! -s "$dropped" ] || msg+=$'\n\n'"Uncommitted changes not kept in the checkout, because they conflict with upstream:"$'\n'"$(tr '\0' '\n' <"$dropped" | sort -u | sed 's/^/  /')"
+	rm -f "$dropped"
+	backup=$(git -C "$dir" commit-tree "$snapshot^{tree}" -p "$head" -p "$snapshot^2" -m "$msg") || return 1
+	backup=$(save_backup "$dir" "$backup" refs/vibes/backup) || return 1
+	if [ -z "$left" ]; then
+		echo "--- local work saved as $backup; the checkout keeps all of it"
+	else
+		echo "--- local work saved as $backup; the checkout can't keep all of it:"
+		git -C "$dir" show -s --format=%b "$backup"
+	fi
+	# Untracked files the backup has and the new checkout doesn't (the rest of the worktree moves with
+	# the reset and read-tree). Nothing else is removed: a file upstream stops ignoring stays put.
+	git -C "$dir" diff -z --name-only --no-renames --diff-filter=D "$snapshot" "$tree" | (cd "$dir" && GIT_LITERAL_PATHSPECS=1 xargs -0 git ls-files -z --others --) | (cd "$dir" && xargs -0 rm -f --) &&
+		git -C "$dir" reset -q --hard "$upstream" && git -C "$dir" read-tree --reset -u "$tree" && git -C "$dir" read-tree "$index_tree" || { checkout_failed "$dir" "$backup" "could not update the checkout"; return 1; }
+	git -C "$dir" update-index -q --refresh >/dev/null
+	# The checkout is the planned tree, plus only files the backup doesn't have (newly unignored ones).
+	kept=$(mktemp) && still_ignored "$dir" "$exposed" >"$kept" && now=$(snapshot_local_work "$dir" "$kept") || { checkout_failed "$dir" "$backup" "could not check the checkout"; return 1; }
+	[ "$(git -C "$dir" write-tree)" = "$index_tree" ] && git -C "$dir" diff --quiet --no-renames --diff-filter=a "$tree" "$now" &&
+		[ -z "$(comm -12 <(git -C "$dir" diff --name-only --no-renames --diff-filter=A "$tree" "$now" | sort) <(git -C "$dir" diff --name-only --no-renames --diff-filter=D "$snapshot" "$tree" | sort))" ]
+	status=$?
+	rm -f "$kept"
+	[ $status -eq 0 ] || { checkout_failed "$dir" "$backup" "the checkout doesn't match the planned update"; return 1; }
+	# Only now is the backup done with, unless the agent still has work in it.
+	[ -n "$left" ] || resolve_ref "$dir" "$backup"
+}
+
+# The backup stays for the agent, whose instructions say the checkout may lack any of it.
+checkout_failed() {
+	local dir=$1 backup=$2 reason=$3 commit
+	commit=$(git -C "$dir" commit-tree "$backup^{tree}" -p "$backup^1" -p "$backup^2" -m "$(git -C "$dir" show -s --format=%B "$backup")
+
+Updating the checkout failed ($reason), so it may be missing any of this work. Compare with the checkout and handle what it doesn't have.") &&
+		git -C "$dir" update-ref "$backup" "$commit"
+	echo "--- $reason; the local work is in $backup, and the next update gives it to the agent"
+}
+
+# git's merge of a saved commit's changes (from base) onto upstream, leaving out changes to the paths
+# listed NUL-separated in the given file. Prints the tree; on a conflict, adds the conflicting paths
+# to the file and returns 1.
+merge_onto_upstream() {
+	local dir=$1 base=$2 upstream=$3 saved=$4 dropped=$5 tree out status
+	tree=$(without_paths "$dir" "$saved" "$base" "$dropped") && out=$(mktemp) || return 2
+	# -z output: the tree, then each conflicting path, NUL-terminated.
+	git -C "$dir" merge-tree --write-tree -z --name-only --no-messages --merge-base="$base^{tree}" "$upstream^{tree}" "$tree" >"$out"
+	status=$?
+	case $status in
+	0) perl -0 -ne 'if ($. == 1) { chomp; print }' "$out" ;;
+	1) perl -0 -ne 'print if $. > 1 && $_ ne "\0"' "$out" >>"$dropped" ;;
+	*) status=2 ;;
+	esac
+	rm -f "$out"
+	return $status
+}
+
+# The commit's tree with the paths listed NUL-separated in the given file as they are in base.
+without_paths() {
+	local dir=$1 commit=$2 base=$3 paths=$4 tmp tree status
+	[ -s "$paths" ] || { git -C "$dir" rev-parse "$commit^{tree}"; return; }
+	tmp=$(mktemp) && rm -f "$tmp" || return 1
+	tree=$(
+		cd "$dir" || exit 1
+		export GIT_INDEX_FILE=$tmp GIT_LITERAL_PATHSPECS=1
+		git read-tree "$commit" &&
+			xargs -0 git rm -q -r -f --cached --ignore-unmatch -- <"$paths" >/dev/null &&
+			xargs -0 git ls-tree -r -z "$base" -- <"$paths" | git update-index -z --index-info &&
+			git write-tree
+	)
+	status=$?
+	rm -f "$tmp"
+	[ $status -eq 0 ] && echo "$tree"
+}
+
+# NUL-separated: those of the listed files that are still there and ignored.
+still_ignored() {
+	[ -s "$2" ] || return 0
+	GIT_LITERAL_PATHSPECS=1 xargs -0 git -C "$1" ls-files -z --others --ignored --exclude-standard -- <"$2"
+}
+
+resolve_backups() {
+	local dir=$1 ref failed=0
+	for ref in $(git -C "$dir" for-each-ref --format='%(refname)' 'refs/vibes/backup-*'); do
+		resolve_backup "$dir" "$ref" || failed=1
+	done
+	return $failed
+}
+
+# Local work the checkout couldn't keep goes to an agent, in a separate worktree at upstream. It opens
+# a PR with the work, or drops it when it isn't worth keeping. Either way the backup moves to
+# refs/vibes/resolved/, so nothing is lost. If the agent doesn't finish, the next update tries again.
+resolve_backup() {
+	local dir=$1 ref=$2 upstream_ref branch repo base work decision before pr_branch action='' url summary pr number status
+	upstream_ref=$(git -C "$dir" rev-parse --abbrev-ref '@{u}') && branch=$(git -C "$dir" symbolic-ref --short HEAD) || return 1
+	repo=$(git -C "$dir" config --get "remote.$(git -C "$dir" config --get "branch.$branch.remote").url") && base=$(git -C "$dir" config --get "branch.$branch.merge") || return 1
+	base=${base#refs/heads/}
+	pr_branch="vibes/$(id -un)-${ref##*/backup-}"
+	work=$(mktemp -d) && decision=$(mktemp) || return 1
+	# An earlier attempt's branch is picked up again.
+	if git -C "$dir" show-ref -q --verify "refs/heads/$pr_branch"; then
+		git -C "$dir" worktree add -q "$work/$(basename "$dir")" "$pr_branch" || return 1
+	else
+		git -C "$dir" worktree add -q --no-track -b "$pr_branch" "$work/$(basename "$dir")" "$upstream_ref" || return 1
+	fi
+	before=$(checkout_state "$dir")
+	local provider
+	provider=$(node -e 'const fs = require("node:fs"); const p = process.argv[1]; const s = fs.existsSync(p) ? JSON.parse(fs.readFileSync(p, "utf8")) : {}; console.log(["openai", "openai-codex"].includes(s.defaultProvider) ? s.defaultProvider : s.enabledModels?.some(m => m.startsWith("openai/")) ? "openai" : "openai-codex");' "${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}/settings.json") || return 1
+	local AGENT_MODEL="$provider/gpt-6.1-sol:medium"
+	echo "--- starting a Pi agent ($AGENT_MODEL) to open a PR with the local work in $ref, or drop it"
+	(cd "$work/$(basename "$dir")" && VIBES_BACKUP=$ref VIBES_PR_BRANCH=$pr_branch VIBES_DECISION_FILE=$decision perl -e 'alarm shift; exec @ARGV' "$AGENT_TIMEOUT_SECONDS" \
+		pi -p --model "$AGENT_MODEL" "$(agent_prompt "$dir" "$ref" "$upstream_ref" "$base" "$pr_branch" "$decision")")
+	status=$?
+	git -C "$dir" worktree remove --force "$work/$(basename "$dir")" && rm -rf "$work"
+	[ "$(checkout_state "$dir")" = "$before" ] || { echo "--- the agent changed $dir, which it must not touch; the local work is still in $ref"; rm -f "$decision"; return 1; }
+	[ $status -eq 0 ] && IFS=$'\x1f' read -r action url summary < <(node -e '
+		const d = JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8"));
+		if (!["pr", "drop"].includes(d.action) || !d.summary || (d.action === "pr" && !d.url)) process.exit(1);
+		console.log([d.action, d.url ?? "", d.summary].map((s) => String(s).replace(/\s+/g, " ")).join("\x1f"));
+	' "$decision" 2>/dev/null)
+	rm -f "$decision"
+	[ -n "$action" ] || { echo "--- the agent didn't finish (no decision); the local work stays in $ref and the next update tries again"; return 1; }
+	if [ "$action" = pr ]; then
+		# The PR with that number in the upstream remote's repository (gh reads any GitHub URL form).
+		number=${url##*/pull/}
+		number=${number%%[!0-9]*}
+		pr=$(gh pr view "$number" -R "$repo" --json state,baseRefName,headRefName,isCrossRepository,headRefOid,url --jq '[.state, .baseRefName, .headRefName, .isCrossRepository, .headRefOid, .url] | @tsv') || { echo "--- could not find the agent's PR $url; the local work stays in $ref"; return 1; }
+		[ "$pr" = "OPEN"$'\t'"$base"$'\t'"$pr_branch"$'\t'false$'\t'"$(git -C "$dir" rev-parse "refs/heads/$pr_branch")"$'\t'"$url" ] || { echo "--- $url is not an open PR in this repository from its branch $pr_branch, at the agent's last commit, into $base; the local work stays in $ref"; return 1; }
+		summary="The nightly update moved local work from $dir into a PR: $url. $summary"
+	else
+		pr=$(gh pr list -R "$repo" --head "$pr_branch" --state open --json url --jq '.[].url') || { echo "--- could not check for a PR from $pr_branch; the local work stays in $ref"; return 1; }
+		[ -z "$pr" ] || { echo "--- the agent dropped the work, but $pr from $pr_branch is still open; the local work stays in $ref"; return 1; }
+		summary="The nightly update dropped local work from $dir: $summary It's kept in ${ref/refs\/vibes\//refs/vibes/resolved/} if you need it."
+	fi
+	resolve_ref "$dir" "$ref" && git -C "$dir" branch -q -D "$pr_branch" && note "$summary"
+}
+
+agent_prompt() {
+	local dir=$1 ref=$2 upstream_ref=$3 base=$4 pr_branch=$5 decision=$6
+	cat <<EOF
+You are the Vibes nightly update agent. Nobody is watching, so finish on your own.
+
+Tonight's update moved the user's checkout of this repository ($dir) to $upstream_ref and kept the uncommitted changes git could merge. The rest of their local work couldn't stay in the checkout. It is saved in $ref: its first parent is where their branch was, the commit itself is their working tree (untracked files too) and its second parent their index. Its message says what the checkout doesn't have:
+
+$(git -C "$dir" show -s --format=%B "$ref")
+
+Only that work is yours to handle. The rest of the backup is still in the user's checkout, so leave it out.
+
+Decide whether that work is worth keeping for the team. Keep real changes to this repository's content. Drop scratch or generated files, temporary output, accidental edits, personal local configuration, and anything upstream already has. If only part is worth keeping, keep that part.
+
+You are in a separate worktree of the repository, on branch $pr_branch, which starts from $upstream_ref. Do not touch $dir. An earlier attempt may have left commits on this branch, pushed it, or opened its PR (gh pr list --head $pr_branch --state all): continue from there.
+
+To keep it: on this branch, apply the work (cherry-pick the local commits; bring in the saved versions of the listed files, combined with upstream's changes so both survive), commit, push the branch, and open a PR into $base with gh. Say what the change is, that the nightly update moved it off $(id -un)'s laptop, and anything a reviewer should check. Never push to $base or force-push.
+
+Finally, write your decision as JSON to $decision, either {"action": "pr", "url": "<PR URL>", "summary": "<one sentence>"} or {"action": "drop", "summary": "<one sentence on what it was and why it isn't worth keeping>"}. If you want to keep the work but can't push or open the PR, don't write the file; say why.
+EOF
+}
+
+# HEAD, index and working tree of a checkout.
+checkout_state() {
+	echo "$(git -C "$1" symbolic-ref -q HEAD) $(git -C "$1" rev-parse HEAD) $(git -C "$1" write-tree) $(git -C "$1" rev-parse "$(snapshot_local_work "$1" /dev/null)^{tree}")"
+}
+
+# NUL-separated: untracked, ignored files a fast-forward could overwrite or delete. Git treats
+# ignored files as expendable. It can replace one at a path upstream changed, one inside a folder
+# upstream puts a file in place of, and one in place of a folder upstream now needs. (macOS xargs
+# runs nothing on empty input; ls-files with no paths would list every ignored file.)
+exposed_ignored_files() {
+	local dir=$1 path prefix
+	git -C "$dir" diff -z --name-only --no-renames HEAD '@{u}' | while IFS= read -r -d '' path; do
+		printf '%s\0' "$path"
+		prefix=$path
+		while [ "${prefix%/*}" != "$prefix" ]; do
+			prefix=${prefix%/*}
+			if [ -e "$dir/$prefix" ] || [ -L "$dir/$prefix" ] && ! { [ -d "$dir/$prefix" ] && [ ! -L "$dir/$prefix" ]; }; then printf '%s\0' "$prefix"; fi
+		done
+	done | GIT_LITERAL_PATHSPECS=1 xargs -0 git -C "$dir" ls-files -z --others --ignored --exclude-standard --
+}
+
+# A commit of the working tree as it is (untracked files, and the ignored files listed NUL-separated
+# in the given file, too) on top of HEAD, with a commit of the index as its second parent. Changes
+# nothing in the repo but its object store.
+snapshot_local_work() {
+	local dir=$1 extra=$2 index_tree index tree tmp status
+	index_tree=$(git -C "$dir" write-tree) || return 1
+	index=$(git -C "$dir" commit-tree "$index_tree" -p HEAD -m "vibes update: index") || return 1
+	tmp=$(mktemp) && rm -f "$tmp" || return 1
+	tree=$(
+		cd "$dir" || exit 1
+		export GIT_INDEX_FILE=$tmp GIT_LITERAL_PATHSPECS=1
+		git read-tree "$index_tree" && git add -A || exit 1
+		if [ -s "$extra" ]; then git add -f --pathspec-from-file="$extra" --pathspec-file-nul || exit 1; fi
+		git write-tree
+	)
+	status=$?
+	rm -f "$tmp"
+	[ $status -eq 0 ] || return 1
+	git -C "$dir" commit-tree "$tree" -p HEAD -p "$index" -m "vibes update: working tree"
+}
+
+# Moves a backup under refs/vibes/resolved/ in one transaction, never overwriting a ref there.
+resolve_ref() {
+	local commit
+	commit=$(git -C "$1" rev-parse "$2") &&
+		printf 'create %s %s\ndelete %s %s\n' "${2/refs\/vibes\//refs/vibes/resolved/}" "$commit" "$2" "$commit" | git -C "$1" update-ref --stdin
+}
+
+# Keeps a commit under a new ref with the given prefix (never overwriting one).
+save_backup() {
+	local dir=$1 commit=$2 prefix=$3 ref
+	ref="$prefix-$(date +%Y%m%d-%H%M%S)-$$"
+	printf 'create %s %s\n' "$ref" "$commit" | git -C "$dir" update-ref --stdin && echo "$ref"
+}
+
+# The problems on Pi's startup screen (stdin) for the folder it started in ($1, resolved).
+# A collision between this folder's own file and the same file in a package is not a problem when
+# the folder is a checkout of that package (~/projects/commercial and the commercial package):
+# Pi uses the checkout's copy. Same package means the same package.json name (the first "name"
+# field: a file that nests one before it just gets its collisions reported).
+startup_problems() {
+	awk -v dir="$1" -v home="$HOME" '
+		function package_name(root,   file, line, name) {
+			file = root "/package.json"; name = ""
+			while (name == "" && (getline line < file) > 0)
+				if (match(line, /"name"[ \t]*:[ \t]*"[^"]*"/)) { name = substr(line, RSTART, RLENGTH); sub(/^"name"[ \t]*:[ \t]*"/, "", name); sub(/"$/, "", name) }
+			close(file)
+			return name
+		}
+		function same_package(root,   own) { own = package_name(dir); return own != "" && package_name(root) == own }
+		# Whether a skipped copy is the same file of the same package as the kept one in the checked folder.
+		function own_copy(skipped,   rel) {
+			rel = substr(kept, length(dir) + 1)
+			return index(kept, dir "/") == 1 && substr(skipped, length(skipped) - length(rel) + 1) == rel && same_package(substr(skipped, 1, length(skipped) - length(rel)))
+		}
+		function flush() {
+			if (block != "" && (kept == "" || other)) printf "%s", block
+			block = ""; kept = ""; other = 0
+		}
+		function path(line) { sub(/^ *[✓✗] (auto \([a-z]+\) )?/, "", line); sub(/ \(skipped\)$/, "", line); sub(/^~/, home, line); return line }
+		/^\[(Skill conflicts|Prompt conflicts|Theme conflicts|Extension issues)\]/ { flush(); section = 1; next }
+		section && /^$/ { flush(); section = 0; next }
+		section && /^  [^ ]/ { flush() }
+		section && /^ *✓ / { kept = path($0) }
+		section && /^ *✗ / && !own_copy(path($0)) { other = 1 }
+		section { block = block $0 "\n"; next }
+		/Error:|Failed to load/ { print }
+		/Trust project folder\?/ { print "Pi stopped at a prompt to trust the folder instead of starting." }
+		END { flush() }
+	'
+}
+
+# Read configuration only: no token access, Keychain dialogs or automatic migration.
+check_gog_keyring() {
+	[ "$(uname -s)" = Darwin ] && command -v gog >/dev/null || return 0
+	local backend
+	backend=$(gog auth keyring --plain --no-input 2>/dev/null | awk '$1 == "keyring_backend" { print $2 }')
+	case "$backend" in
+	auto|keychain)
+		echo "WARNING: gog uses macOS Keychain; agents may trigger repeated permission prompts. Migrate to the encrypted file keyring: $VIBES/docs/gog-credentials.md"
+		;;
+	esac
+	return 0
+}
+
+cmd_check() {
+	local dir=$1 scratch screen="" previous="" stable=0 problems
+	check_gog_keyring
+	command -v tmux >/dev/null || { echo "vibes check needs tmux: brew install tmux"; return 1; }
+	scratch=$(mktemp -d)
+	# With no folder, start in an empty one: that checks the global setup on its own. A folder's own
+	# .pi config loads too (--approve trusts it for this run only).
+	local pi_args=(--no-session)
+	if [ -n "$dir" ]; then pi_args+=(--approve); else dir=$scratch/empty && mkdir "$dir"; fi
+	local real_dir
+	real_dir=$(cd "$dir" && pwd -P) || { rm -rf "$scratch"; return 1; }
+	# A private tmux server, so the user's sessions are untouched and Pi gets this PATH.
+	local tmux=(tmux -S "$scratch/tmux")
+	"${tmux[@]}" new-session -d -x 220 -y 80 -c "$dir" -e "PATH=$PATH" -e "VIBES_CHECK_READY=$scratch/ready" \
+		${PI_CODING_AGENT_DIR:+-e "PI_CODING_AGENT_DIR=$PI_CODING_AGENT_DIR"} ${INVENTORY:+-e "VIBES_INVENTORY=$INVENTORY"} \
+		"pi ${pi_args[*]}; echo '[pi exited]'; sleep 600" || { rm -rf "$scratch"; return 1; }
+	# Pi has finished starting when extensions/vibes-check.ts writes the marker, or it has exited.
+	local waited=0 started=""
+	while [ $waited -lt "$CHECK_TIMEOUT_SECONDS" ]; do
+		sleep 2 && waited=$((waited + 2))
+		screen=$("${tmux[@]}" capture-pane -p -J -S - -t 0 | sed 's/[[:space:]]*$//')
+		if [ -e "$scratch/ready" ] || grep -q '^\[pi exited\]' <<<"$screen"; then started=1 && break; fi
+		grep -q 'Trust project folder?' <<<"$screen" && break
+	done
+	# Then let notices from the last handlers render.
+	for _ in $(seq 1 10); do
+		[ -n "$started" ] || break
+		sleep 2
+		screen=$("${tmux[@]}" capture-pane -p -J -S - -t 0 | sed 's/[[:space:]]*$//')
+		if [ "$screen" = "$previous" ]; then stable=$((stable + 1)); else stable=0; fi
+		previous=$screen
+		[ $stable -ge 2 ] && break
+	done
+	# Commands run after startup and resource discovery have both finished.
+	if [ -n "$started" ] && [ -n "${INVENTORY:-}" ] && ! grep -q '^\[pi exited\]' <<<"$screen"; then
+		"${tmux[@]}" send-keys -t 0 -l /vibes-inventory
+		"${tmux[@]}" send-keys -t 0 Enter
+		for _ in $(seq 1 10); do
+			[ -s "$INVENTORY" ] && break
+			sleep 1
+		done
+	fi
+	"${tmux[@]}" kill-server
+	rm -rf "$scratch"
+	problems=$(startup_problems "$real_dir" <<<"$screen")
+	if grep -q '^\[pi exited\]' <<<"$screen"; then
+		problems="Pi exited while starting. Last screen:
+$(grep -v '^$' <<<"$screen" | grep -v '^\[pi exited\]' | tail -15)${problems:+
+
+$problems}"
+	elif [ -z "$started" ]; then
+		problems="Pi did not finish starting within $CHECK_TIMEOUT_SECONDS seconds (or the Vibes package isn't loaded). Last screen:
+$(grep -v '^$' <<<"$screen" | tail -15)${problems:+
+
+$problems}"
+	fi
+	if [ -z "$problems" ]; then
+		echo "Pi started cleanly in $dir."
+		return 0
+	fi
+	echo "Pi reported startup problems in $dir:"
+	echo "$problems"
+	return 1
+}
+
+write_status() {
+	local ok=$1 template=${2:-}
+	mkdir -p "$(dirname "$STATUS_FILE")"
+	node -e '
+		const [file, notesFile, ok, log, template, ...rows] = process.argv.slice(1);
+		const steps = rows.map((row) => { const [name, result, detail] = row.split("\t"); return { name, ok: result === "ok", detail }; });
+		// Notes Pi has not shown yet (vibes-update-seen holds the finishedAt it last showed) carry over.
+		const fs = require("node:fs");
+		const read = (f) => { try { return fs.readFileSync(f, "utf8"); } catch (e) { if (e.code === "ENOENT") return undefined; throw e; } };
+		const previous = JSON.parse(read(file) ?? "{}");
+		const seen = read(require("node:path").join(require("node:path").dirname(file), "vibes-update-seen"))?.trim();
+		const added = (read(notesFile) ?? "").split("\n").filter(Boolean);
+		const notes = [...(previous.notes?.length && previous.finishedAt !== seen ? previous.notes : []), ...added];
+		// Only an explicit `vibes update` records the template it installed. Startup never infers one.
+		const agentsTemplateHash = template ? require("node:crypto").createHash("sha256").update(fs.readFileSync(template)).digest("hex") : undefined;
+		fs.writeFileSync(file, JSON.stringify({ finishedAt: new Date().toISOString(), ok: ok === "true", log, steps, notes, agentsTemplateHash }, null, 2) + "\n");
+		fs.rmSync(notesFile, { force: true });
+	' "$STATUS_FILE" "$NOTES_FILE" "$ok" "$LOG_FILE" "$template" "${RESULTS[@]}"
+}
+
+# Runs a command while holding the update lock, in place of the calling shell, so a signal to the
+# process launchd started reaches the lock holder (call it in a subshell to continue). The kernel releases a flock when its holder exits, however it exits, so a crashed run
+# never leaves a stale lock. Perl holds it (macOS has no flock command) and runs the command in its
+# own process group, with no terminal input; a TERM, INT or HUP stops the whole group, and anything
+# the run left behind is stopped when it ends. The command doesn't inherit the lock: Perl opens it
+# close-on-exec.
+with_lock() {
+	exec /usr/bin/perl -MFcntl=:flock -e '
+		my $file = shift;
+		open(my $lock, ">>", $file) or die "cannot open $file: $!\n";
+		flock($lock, LOCK_EX | LOCK_NB) or do { print "vibes update is already running.\n"; exit 75 };
+		my $pid = fork() // die "fork: $!\n";
+		if ($pid == 0) {
+			setpgrp(0, 0);
+			open(STDIN, "<", "/dev/null");
+			exec @ARGV or die "exec $ARGV[0]: $!\n";
+		}
+		$SIG{$_} = sub { kill $_[0], -$pid } for qw(TERM INT HUP);
+		waitpid($pid, 0);
+		my $status = $?;
+		kill "TERM", -$pid;
+		exit($status & 127 ? 128 + ($status & 127) : $status >> 8);
+	' "$LOCK_FILE" "$@"
+}
+
+# launchd sends output to the log already; a run by hand copies it there too.
+log_output() {
+	mkdir -p "$(dirname "$LOG_FILE")"
+	if ! /usr/bin/perl -e 'my @a = stat(STDOUT); my @b = stat($ARGV[0]); exit !(@b && $a[0] == $b[0] && $a[1] == $b[1])' "$LOG_FILE"; then
+		exec > >(tee -a "$LOG_FILE") 2>&1
+	fi
+}
+
+cmd_update() {
+	if [ -z "${VIBES_UPDATE_LOCKED:-}" ]; then
+		mkdir -p "$(dirname "$LOCK_FILE")"
+		export VIBES_UPDATE_LOCKED=1
+		with_lock "$VIBES/scripts/vibes" update
+	fi
+	local previous hotfix row
+	if [ -z "${VIBES_UPDATE_CONTINUED:-}" ]; then
+		log_output
+		export NVM_DIR="$HOME/.nvm"
+		export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+		echo "=== $(date '+%Y-%m-%d %H:%M:%S') vibes update"
+		python3 "$VIBES/scripts/refresh" begin-update || return 1
+
+		step homebrew update_brew
+		step nvm update_nvm
+		load_nvm
+		step node update_node
+		echo "node $(node -v) npm $(npm -v)"
+		step npm npm install -g npm@latest
+		# The templates as they were before this update, so settings the user changed stay theirs.
+		previous=$(mktemp -d)
+		cp "$VIBES/settings.template.json" "$VIBES/subagent-config.template.json" "$VIBES/web-search.template.json" "$previous/" 2>/dev/null
+		[ ! -f "$VIBES/models.template.json" ] || cp "$VIBES/models.template.json" "$previous/"
+		# Hotfixes tag main, so updating to main now includes every hotfix tagged before it.
+		hotfix=$(latest_hotfix 2>/dev/null)
+		step packages update_vibes_packages
+		[ -z "$hotfix" ] || [ "$(cut -f2 <<<"${RESULTS[${#RESULTS[@]} - 1]}")" != ok ] || echo "$hotfix" >"$HOTFIX_FILE"
+		# The packages step may have just replaced this script. Carry on in the new one, so a change to
+		# the update itself takes effect the night it ships. Same process, so the lock and log carry over.
+		# Keep these three variables working: the previous night's script hands over with them.
+		export VIBES_UPDATE_CONTINUED=1 VIBES_UPDATE_PREVIOUS="$previous" VIBES_UPDATE_RESULTS
+		VIBES_UPDATE_RESULTS=$(printf '%s\n' "${RESULTS[@]}")
+		exec "$VIBES/scripts/vibes" update
+	fi
+	load_nvm
+	previous=$VIBES_UPDATE_PREVIOUS
+	while IFS= read -r row; do [ -z "$row" ] || RESULTS+=("$row"); done <<<"$VIBES_UPDATE_RESULTS"
+	unset VIBES_UPDATE_RESULTS VIBES_UPDATE_PREVIOUS
+	step rolling-packages refresh_rolling_packages
+	step settings sync_settings "$previous"
+	rm -rf "$previous"
+	! pi_1_migration_needed || step mcp-before capture_pi_1_baseline
+	step pi install_pinned_pi
+	step hotfix-job install_hotfix_job
+	step refresh-job install_refresh_job
+	INVENTORY=$(mktemp)
+	step startup cmd_check
+	! pi_1_migration_needed || step pi-1-migration run_pi_1_migration
+	# Keep the last valid startup report locally so a failed upload can retry without another
+	# full update. This raw file stays on the laptop; scripts/inventory shapes/redacts uploads.
+	if [ -s "$INVENTORY" ] && python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); sys.exit("error" in d)' "$INVENTORY"; then
+		install -m 600 "$INVENTORY" "$AGENT_DIR/vibes-inventory.json"
+	fi
+	step telemetry "$VIBES/scripts/inventory" send "$INVENTORY"
+	step usage-telemetry "$VIBES/scripts/usage-telemetry" send
+	rm -f "$INVENTORY"
+
+	local failed=() pending=0 name result detail
+	for row in "${RESULTS[@]}"; do
+		IFS=$'\t' read -r name result detail <<<"$row"
+		[ "$result" = ok ] && continue
+		case "$name" in
+		telemetry|usage-telemetry) ((pending += 1)) ;;
+		*) failed+=("$name") ;;
+		esac
+	done
+	if [ ${#failed[@]} -eq 0 ]; then
+		write_status true "$VIBES/AGENTS.template.md"
+		if [ "$pending" -gt 0 ]; then
+			echo 'Update succeeded; telemetry upload pending. Vibes retries hourly; run `vibes refresh` to retry now.'
+		fi
+	else
+		write_status false
+		osascript -e "display notification \"Failed: ${failed[*]}. See ~/Library/Logs/pi-update.log\" with title \"vibes update\"" >/dev/null 2>&1
+	fi
+	python3 "$VIBES/scripts/refresh" record-update || return 1
+	echo "=== done (${#failed[@]} failed${failed[*]:+: ${failed[*]}}; $pending uploads pending)"
+	[ ${#failed[@]} -eq 0 ] && [ "$pending" -eq 0 ]
+}
+
+cmd_status() {
+	[ -f "$STATUS_FILE" ] || { echo "vibes update has not run on this Mac yet."; return 1; }
+	command -v node >/dev/null || { NVM_DIR=${NVM_DIR:-$HOME/.nvm} load_nvm; }
+	node -e '
+		const s = JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8"));
+		const failed = s.steps.filter(step => !step.ok);
+		const installationFailed = failed.some(step => !["telemetry", "usage-telemetry"].includes(step.name));
+		console.log(`Last update: ${new Date(s.finishedAt).toLocaleString("en-GB")} (${installationFailed ? "failed" : "succeeded"})`);
+		if (!installationFailed && failed.length) console.log("Update succeeded; telemetry upload pending. Vibes retries hourly; run `vibes refresh` to retry now.");
+		for (const step of s.steps) console.log(`  ${step.ok ? "ok  " : "FAIL"} ${step.name}${step.detail ? ` (${step.detail})` : ""}`);
+		for (const note of s.notes ?? []) console.log(note);
+		console.log(`Log: ${s.log}`);
+	' "$STATUS_FILE"
+}
+
+main() {
+	case "${1:-}" in
+	update) cmd_update ;;
+	refresh) cmd_refresh ;;
+	usage) shift; "$VIBES/scripts/usage-telemetry" "${@:-collect}" ;;
+	status) cmd_status ;;
+	features) shift; node "$VIBES/scripts/features.mjs" "$@" ;;
+	check) cmd_check "${2:-}" ;;
+	hotfix) cmd_hotfix "${2:-}" ;;
+	hotfix-check) cmd_hotfix_check ;;
+	report) "$VIBES/scripts/inventory" "$@" ;;
+	inventory) (
+		INVENTORY=$(mktemp) || exit
+		trap 'rm -f "$INVENTORY"' EXIT
+		cmd_check >&2 && "$VIBES/scripts/inventory" show "$INVENTORY"
+	) ;;
+	*)
+		echo "usage: vibes update | vibes refresh | vibes usage [collect|send] | vibes check [dir] | vibes inventory | vibes status | vibes features [migrate [--apply] [--source <source>]] | vibes report <session.jsonl> <summary> | vibes hotfix <what it fixes> | vibes hotfix-check"
+		return 2
+		;;
+	esac
+}
+
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then main "$@"; exit; fi

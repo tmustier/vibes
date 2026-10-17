@@ -1,0 +1,27 @@
+#!/bin/bash
+# Update this distribution without merging another repository or pushing local changes.
+set -euo pipefail
+repo="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+export NVM_DIR="$HOME/.nvm"
+. "$NVM_DIR/nvm.sh" --no-use
+nvm use --silent default >/dev/null
+log="$HOME/Library/Logs/pi-personal-update.log"
+mkdir -p "$(dirname "$log")"
+exec >>"$log" 2>&1
+printf '\n=== %s personal Vibes update ===\n' "$(date)"
+[ -z "$(git -C "$repo" status --porcelain)" ] || { echo 'Local Vibes checkout is dirty; update skipped.'; exit 1; }
+previous="$(mktemp -d)"
+trap 'rm -rf "$previous"' EXIT
+cp "$repo/settings.template.json" "$repo/subagent-config.template.json" "$repo/web-search.template.json" "$previous/"
+[ ! -f "$repo/models.template.json" ] || cp "$repo/models.template.json" "$previous/"
+git -C "$repo" fetch --quiet origin main
+git -C "$repo" merge --ff-only origin/main
+(cd "$repo" && npm ci --omit=dev --ignore-scripts && npm install --no-save --omit=dev codex-computer-use-mcp@latest @tmustier/pi-session-hud@latest)
+node "$repo/scripts/sync-settings.mjs" "$previous" "$repo" "$HOME/.pi/agent"
+pinned="$(node -p "require('$repo/package.json').devDependencies['@earendil-works/pi-coding-agent']")"
+cutoff="$(node -p "require('$repo/package.json').piDependencyCutoff")"
+[ "$(pi --version)" = "$pinned" ] || npm install -g --ignore-scripts --before "$cutoff" "@earendil-works/pi-coding-agent@$pinned"
+"$repo/scripts/vibes" check
+[ -z "$(git -C "$repo" status --porcelain)" ] || { echo 'Update left a dirty checkout.'; exit 1; }
+printf '=== update succeeded: %s ===\n' "$(git -C "$repo" rev-parse --short HEAD)"

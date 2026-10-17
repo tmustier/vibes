@@ -1,0 +1,30 @@
+# Vibes-managed zsh extras for personal Macs.
+# Sourced from ~/.zshrc out of the Vibes package checkout (/onboard adds the
+# source line; `vibes update` keeps this file current). Keep secrets and machine-specific
+# paths out of this file.
+
+# Completion system — needed for the "completion" suggestion strategy below.
+# Skipped if something earlier in ~/.zshrc (e.g. oh-my-zsh) already ran compinit.
+if ! typeset -f compdef >/dev/null 2>&1; then
+  autoload -Uz compinit
+  compinit
+fi
+
+# Inline grey autosuggestions as you type, from shell history and
+# tab-completion candidates. Accept with the right arrow key.
+if [ -r /opt/homebrew/share/zsh-autosuggestions/zsh-autosuggestions.zsh ]; then
+  source /opt/homebrew/share/zsh-autosuggestions/zsh-autosuggestions.zsh
+elif [ -r /usr/local/share/zsh-autosuggestions/zsh-autosuggestions.zsh ]; then
+  source /usr/local/share/zsh-autosuggestions/zsh-autosuggestions.zsh
+fi
+if [ -n "${ZSH_AUTOSUGGEST_VERSION:-}" ] || typeset -f _zsh_autosuggest_start >/dev/null 2>&1; then
+  ZSH_AUTOSUGGEST_STRATEGY=(history completion)
+  ZSH_AUTOSUGGEST_BUFFER_MAX_SIZE=20
+fi
+
+# Launch Pi, trusting project-local config without the trust prompt —
+# Pi's closest equivalent of Claude Code's --dangerously-skip-permissions.
+alias yolo='pi --approve'
+
+# `vibes update` installs the pinned Pi version, so don't prompt to update Pi separately.
+export PI_SKIP_VERSION_CHECK=1

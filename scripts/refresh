@@ -1,0 +1,143 @@
+#!/usr/bin/env python3
+"""Catch up a missed nightly update and retry aggregate uploads on login/hourly ticks.
+
+Called by scripts/vibes while holding its existing update lock. No transcript data lives here.
+"""
+from __future__ import annotations
+
+import datetime as dt
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+
+VIBES = Path(__file__).resolve().parents[1]
+# agent-default (not a user rule): 2026-10-14. Retry at the catch-up job's hourly cadence.
+RETRY_SECONDS = 3600
+# The existing nightly schedule from /onboard, interpreted in the laptop's local timezone.
+NIGHTLY_HOUR, NIGHTLY_MINUTE = 4, 4
+UPLOAD_STEPS = {"telemetry", "usage-telemetry"}
+
+
+def agent_dir() -> Path:
+    return Path(os.environ.get("PI_CODING_AGENT_DIR") or Path.home() / ".pi" / "agent")
+
+
+def read(path: Path) -> dict:
+    return json.loads(path.read_text()) if path.is_file() else {}
+
+
+def save(state: dict, path: Path | None = None) -> None:
+    path = path or agent_dir() / "vibes-refresh.json"
+    folder = path.parent
+    folder.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=".vibes-refresh-", dir=folder)
+    try:
+        with os.fdopen(fd, "w") as stream:
+            json.dump(state, stream, indent=2)
+            stream.write("\n")
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def stamp(now: dt.datetime) -> str:
+    return now.astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def parsed(value: str | None) -> float:
+    return dt.datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp() if value else 0
+
+
+def latest_nightly(now: dt.datetime) -> float:
+    # Build the wall-clock boundary afresh so DST does not turn 04:04 into 03:04 or 05:04.
+    local = dt.datetime.fromtimestamp(now.timestamp())
+    boundary = local.replace(hour=NIGHTLY_HOUR, minute=NIGHTLY_MINUTE, second=0, microsecond=0)
+    if local < boundary:
+        boundary -= dt.timedelta(days=1)
+    return boundary.timestamp()
+
+
+def due(state: dict, now: dt.datetime) -> bool:
+    return (parsed(state.get("lastUpdateSuccessAt")) < latest_nightly(now)
+            and now.timestamp() - parsed(state.get("lastUpdateAttemptAt")) >= RETRY_SECONDS)
+
+
+def begin_update(now: dt.datetime) -> None:
+    state = read(agent_dir() / "vibes-refresh.json")
+    state["lastUpdateAttemptAt"] = stamp(now)
+    save(state)
+
+
+def record_update() -> None:
+    state = read(agent_dir() / "vibes-refresh.json")
+    status = read(agent_dir() / "vibes-update.json")
+    steps = [step for step in status.get("steps", []) if step["name"] not in UPLOAD_STEPS]
+    if steps and all(step["ok"] for step in steps):
+        state["lastUpdateSuccessAt"] = status["finishedAt"]
+    save(state)
+
+
+def run(now: dt.datetime, execute=subprocess.call) -> int:
+    state = read(agent_dir() / "vibes-refresh.json")
+    # Seed existing installations from the last full nightly run, never a hotfix-only result.
+    if "lastUpdateSuccessAt" not in state:
+        previous = read(agent_dir() / "vibes-update.json")
+        steps = previous.get("steps", [])
+        if any(step["name"] == "homebrew" for step in steps):
+            core = [step for step in steps if step["name"] not in UPLOAD_STEPS]
+            if all(step["ok"] for step in core):
+                state["lastUpdateSuccessAt"] = previous["finishedAt"]
+                save(state)
+    result = 0
+    if due(state, now):
+        # The update records its own success separately from upload success. Mark the attempt
+        # before starting too, so a crash early in startup does not cause a login retry loop.
+        state["lastUpdateAttemptAt"] = stamp(now)
+        save(state)
+        result = execute([str(VIBES / "scripts/vibes"), "update"])
+        if result == 0:
+            return 0  # The full update already collected and sent both kinds of telemetry.
+    # Upload failure must not cause Homebrew, npm and repositories to update every hour.
+    # Collection still runs while offline; the collector retains dirty periods for the next tick.
+    cached = agent_dir() / "vibes-inventory.json"
+    outcomes = {}
+    if cached.is_file():
+        outcomes["telemetry"] = execute([str(VIBES / "scripts/inventory"), "send", str(cached)])
+    outcomes["usage-telemetry"] = execute([str(VIBES / "scripts/usage-telemetry"), "send"])
+    # Clear resolved upload failures without pretending a failed installation was repaired,
+    # or changing the date of the last full update and replaying its user-facing notes.
+    path = agent_dir() / "vibes-update.json"
+    status = read(path)
+    if status:
+        steps = status.setdefault("steps", [])
+        for name, code in outcomes.items():
+            step = next((step for step in steps if step["name"] == name), None)
+            if step is None:
+                step = {"name": name}
+                steps.append(step)
+            step.update(ok=code == 0, detail="" if code == 0 else f"exit {code}")
+        status["ok"] = all(step["ok"] for step in steps if step["name"] not in UPLOAD_STEPS)
+        save(status, path)
+    return next((code for code in outcomes.values() if code), result)
+
+
+def main(argv: list[str]) -> int:
+    now = dt.datetime.now(dt.timezone.utc)
+    if argv == ["run"]:
+        return run(now)
+    if argv == ["begin-update"]:
+        begin_update(now)
+        return 0
+    if argv == ["record-update"]:
+        record_update()
+        return 0
+    print("usage: refresh run | begin-update | record-update", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

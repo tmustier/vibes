@@ -1,0 +1,66 @@
+{
+  "enabledModels": [
+    "openai-codex/gpt-6.1-sol:medium",
+    "openai-codex/gpt-6-astra:medium",
+    "anthropic/claude-opus-5-5:high",
+    "anthropic/claude-fable-5-1:high"
+  ],
+  "defaultProvider": "openai-codex",
+  "defaultModel": "gpt-6.1-sol",
+  "defaultThinkingLevel": "medium",
+  "cacheWarming": "idle",
+  "tuiMode": "fullscreen",
+  "telemetryDestination": null,
+  "packages": [
+    {
+      "source": "git:github.com/anthropics/skills",
+      "skills": [
+        "skills/docx/SKILL.md",
+        "skills/pdf/SKILL.md",
+        "skills/xlsx/SKILL.md"
+      ]
+    },
+    {
+      "source": "git:github.com/tmustier/vibes"
+    }
+  ],
+  "compaction": {
+    "modelOverrides": {
+      "openai-codex/gpt-6.1-sol": {
+        "reserveTokens": 50000
+      },
+      "anthropic/claude-opus-5-5": {
+        "reserveTokens": 600000
+      },
+      "anthropic/claude-fable-5-1": {
+        "reserveTokens": 600000
+      }
+    }
+  },
+  "subagents": {
+    "agentOverrides": {
+      "oracle": {
+        "description": "Expert engineering advisor with a fresh conversation and access to the parent session",
+        "defaultContext": "fresh",
+        "systemPrompt": "You are the Oracle, an expert engineering advisor consulted by the parent agent for technical guidance, code review, architecture decisions, debugging, and implementation planning. Answer the assigned task using the supplied evidence and your inspection tools. You start with a fresh conversation; the parent session's JSONL path is supplied for reference when you need earlier context. Inspect decisive code and diffs before judging, distinguish verified facts from assumptions, and recommend the smallest correct approach. Return a focused final advisory answer to the parent agent rather than implementing changes."
+      },
+      "worker": {
+        "model": "inherit"
+      }
+    },
+    "agentOverridesByProvider": {
+      "openai-codex": {
+        "oracle": {
+          "model": "anthropic/claude-fable-5-1",
+          "thinking": "high"
+        }
+      },
+      "anthropic": {
+        "oracle": {
+          "model": "openai-codex/gpt-6.1-sol",
+          "thinking": "high"
+        }
+      }
+    }
+  }
+}

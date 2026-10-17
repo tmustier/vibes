@@ -1,0 +1,488 @@
+#!/usr/bin/env python3
+"""Aggregate persisted Pi usage. No transcript text leaves this process."""
+from __future__ import annotations
+
+import argparse
+from collections import defaultdict
+from datetime import datetime, timezone
+import hashlib
+import json
+import math
+import os
+from pathlib import Path
+import re
+import sqlite3
+import sys
+import uuid
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "lib"))
+from telemetry_destination import GitHub, Http, destination
+
+TOKENS = ("input", "output", "cacheRead", "cacheWrite", "cacheWrite1h", "reasoning", "totalTokens")
+COSTS = ("input", "output", "cacheRead", "cacheWrite", "total")
+TOOLS = set("read bash edit write grep find ls exec subagent subagent_wait bg_wait web_search web_fetch".split())
+PROVIDERS = set("anthropic openai openai-codex google google-vertex amazon-bedrock azure-openai-responses github-copilot openrouter xai mistral groq cerebras".split())
+EFFORTS = set("off minimal low medium high xhigh max adaptive".split())
+KINDS = set("cache_warm assistant compaction branch_summary tool subagent_summary".split())
+DIMENSIONS = ("kind", "provider", "model", "responseModel", "thinkingLevel", "providerThinkingLevel")
+# agent-default (not a user rule): 2026-10-14. Longer exported identity labels use a hash.
+IDENTIFIER_LIMIT = 128
+
+
+def packed(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
+
+
+def digest(value):
+    return hashlib.sha256(packed(value).encode()).hexdigest()
+
+
+def identity(value, known=()):
+    if not isinstance(value, str) or not value:
+        return "unknown"
+    if value in known or (len(value) <= IDENTIFIER_LIMIT and ".." not in value and
+                         re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.:-]*", value)):
+        return value
+    return "other-" + digest(value)[:20]
+
+
+def model_name(value):
+    # A provider namespace is part of some registered model IDs, not a file path.
+    if isinstance(value, str) and len(value) <= IDENTIFIER_LIMIT and ".." not in value and re.fullmatch(
+        r"[A-Za-z][A-Za-z0-9_.:-]*/[A-Za-z][A-Za-z0-9_.:-]*", value):
+        return value
+    return identity(value)
+
+
+def extension_name(value):
+    if not isinstance(value, str) or not value:
+        return "unknown"
+    package = re.fullmatch(r"(?:npm:)?(@[A-Za-z0-9_-]+/[A-Za-z0-9_.-]+|[A-Za-z0-9_-][A-Za-z0-9_.-]*)(?:@[^/\s]+)?", value)
+    if package and ".." not in package[1] and len(package[1]) <= IDENTIFIER_LIMIT:
+        return package[1]
+    repo = re.fullmatch(r"(?:git:)?(?:https://github\.com/|git@github\.com:|github\.com/|github:)([A-Za-z0-9_-]+)/([A-Za-z0-9_.-]+)(?:#[^\s]*)?", value)
+    if repo and ".." not in repo[2] and len(repo[1] + repo[2]) <= IDENTIFIER_LIMIT - len("github:/"):
+        return "github:" + repo[1] + "/" + repo[2].removesuffix(".git")
+    return "other-" + digest(value)[:20]
+
+
+def timestamp(value):
+    try:
+        dt = (datetime.fromtimestamp(value / 1000, timezone.utc) if isinstance(value, (int, float))
+              else datetime.fromisoformat(value.replace("Z", "+00:00")))
+        if dt.tzinfo is None:
+            return None
+        return dt.astimezone(timezone.utc)
+    except (ValueError, TypeError, AttributeError, OverflowError, OSError):
+        return None
+
+
+def day(value):
+    dt = timestamp(value)
+    return dt.strftime("%Y-%m-%d") if dt else None
+
+
+def number(value):
+    return value if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value >= 0 else 0
+
+
+def usage(value):
+    if not isinstance(value, dict):
+        return None
+    result = {key: number(value.get(key)) for key in TOKENS}
+    cost = value.get("cost", {})
+    result["cost"] = {key: number(cost.get(key)) for key in COSTS} if isinstance(cost, dict) else {
+        **dict.fromkeys(COSTS, 0), "total": number(cost)}
+    return result
+
+
+def load(path):
+    return json.loads(path.read_text()) if path.is_file() else {}
+
+
+class Collector:
+    def __init__(self, agent):
+        self.agent = agent
+        state = agent / "usage-telemetry"
+        state.mkdir(mode=0o700, parents=True, exist_ok=True)
+        # 60-second lock wait: agent-default (not a user rule): 2026-10-14
+        self.db = sqlite3.connect(state / "state.sqlite3", timeout=60)
+        os.chmod(state / "state.sqlite3", 0o600)
+        self.db.executescript("""
+            CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS files (path TEXT PRIMARY KEY, stamp TEXT, offset INTEGER,
+                prefix TEXT, header TEXT, context TEXT);
+            CREATE TABLE IF NOT EXISTS events (id TEXT PRIMARY KEY, payload TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS periods (month TEXT PRIMARY KEY, body TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS sent (login TEXT, month TEXT, hash TEXT,
+                PRIMARY KEY(login, month));
+        """)
+        self.db.execute("INSERT OR IGNORE INTO meta VALUES ('installation', ?)", (str(uuid.uuid4()),))
+        if self.meta("parserVersion") != "3":
+            self.db.execute("UPDATE files SET stamp=NULL, prefix=''")
+            self.db.execute("INSERT OR REPLACE INTO meta VALUES ('parserVersion', '3')")
+        self.db.commit()
+        self.installation = self.meta("installation")
+        self.mapping = json.loads(self.meta("mapping") or '{}')
+        self.known_skills = {}
+        for root in (agent / "skills", ROOT / "skills"):
+            for path in root.rglob("SKILL.md"):
+                self.known_skills[str(path.resolve())] = identity(path.parent.name)
+
+    def meta(self, key):
+        row = self.db.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+        return row[0] if row else None
+
+    def put(self, key, payload):
+        old = self.db.execute("SELECT payload FROM events WHERE id=?", (key,)).fetchone()
+        if old and payload.get("summaries"):
+            previous = json.loads(old[0])
+            payload["references"] = sorted(set(payload["references"] + previous.get("references", [])))
+            for current in payload["summaries"]:
+                for prior in previous.get("summaries", []):
+                    if current["id"] == prior["id"]:
+                        for field in ("refs", "directories"):
+                            current[field] = sorted(set(current[field] + prior.get(field, [])))
+        self.db.execute("INSERT OR REPLACE INTO events VALUES (?, ?)", (key, packed(payload)))
+
+    def resource_mapping(self, path):
+        raw = load(path)
+        if "error" in raw:
+            raise ValueError("Inventory snapshot reports an error")
+        extensions = {}
+        packages = []
+        for item in raw.get("packages", []):
+            if item.get("installedPath"):
+                packages.append((str(Path(item["installedPath"]).resolve()), extension_name(item.get("source"))))
+        packages.sort(key=lambda item: -len(item[0]))
+        for item in raw.get("extensions", []):
+            extensions[str(Path(item["path"]).resolve())] = extension_name(item.get("bundles", {}).get("package"))
+
+        def origin(item):
+            # Built-in source paths are labels, not relative files inside whichever cwd
+            # happened to launch the collector. Check them before package-root matching.
+            if item.get("source") == "builtin" or item.get("path", "").startswith("builtin:"):
+                return "builtin"
+            path = str(Path(item.get("path", "")).resolve())
+            if extensions.get(path, "unknown") != "unknown":
+                return extensions[path]
+            for root, name in packages:
+                if path.startswith(root + os.sep):
+                    return name
+            return "builtin" if item.get("source") == "builtin" else "unknown"
+
+        mapping = {
+            "tools": {item["name"]: origin(item) for item in raw.get("tools", [])},
+            "skills": {str(Path(item["path"]).resolve()): identity(item.get("name")) for item in raw.get("skills", [])
+                       if Path(item["path"]).name == "SKILL.md"},
+        }
+        if mapping != self.mapping:
+            # New resource evidence can improve historical attribution. Force one reparse.
+            self.db.execute("UPDATE files SET stamp=NULL, prefix='' ")
+        self.mapping = mapping
+        self.db.execute("INSERT OR REPLACE INTO meta VALUES ('mapping', ?)", (packed(self.mapping),))
+        date = day(raw.get("generatedAt"))
+        if date:
+            counts = defaultdict(int)
+            for item in raw.get("extensions", []):
+                if item.get("enabled"):
+                    counts[origin(item)] += 1
+            self.put("inventory:" + digest(raw.get("generatedAt")), {
+                "day": date, "resources": dict(counts)})
+
+    def scan(self):
+        pending = []
+        roots = [self.agent / "sessions", *self.agent.glob("vibes-pi-1-*/sessions")]
+        for session_root in roots:
+            # The configured sessions root may be a symlink (for example to another disk).
+            # os.walk does not follow nested directory links, so it cannot recurse in a loop.
+            for root, dirs, files in os.walk(session_root):
+                dirs[:] = [d for d in dirs if d not in ("node_modules", ".git", "git", "npm", "extensions")]
+                pending.extend(Path(root) / name for name in files if name.endswith(".jsonl"))
+        # Revisit previously referenced child sessions even if their parent is unchanged.
+        for payload, in self.db.execute("SELECT payload FROM events"):
+            pending += [Path(p) for p in json.loads(payload).get("references", [])]
+        visited = set()
+        while pending:
+            path = pending.pop().resolve()
+            if path in visited or not path.is_file():
+                continue
+            visited.add(path)
+            pending.extend(self.scan_file(path))
+
+    def scan_file(self, path):
+        stat = path.stat()
+        stamp = packed([stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns])
+        old = self.db.execute("SELECT stamp,offset,prefix,header,context FROM files WHERE path=?", (str(path),)).fetchone()
+        if old and old[0] == stamp:
+            return []
+        data = path.read_bytes()
+        offset, header, contexts = 0, {}, {}
+        if old and len(data) >= old[1] and hashlib.sha256(data[:old[1]]).hexdigest() == old[2]:
+            offset, header, contexts = old[1], json.loads(old[3]), json.loads(old[4])
+        end = data.rfind(b"\n") + 1
+        refs = []
+        for line in data[offset:end].splitlines():
+            try:
+                entry = json.loads(line)
+            except (ValueError, UnicodeDecodeError):
+                continue  # Never guess usage from malformed text.
+            if not isinstance(entry, dict):
+                continue
+            if not header:
+                if entry.get("type") != "session":
+                    return []  # Debug/mirror recordType transcripts are not sessions.
+                header = entry
+                continue
+            context = dict(contexts.get(entry.get("parentId"), {}) if "parentId" in entry
+                           else contexts.get("_last", {}))
+            if entry.get("type") == "model_change":
+                context.update(provider=entry.get("provider"), model=entry.get("modelId"))
+            elif entry.get("type") == "thinking_level_change":
+                context["effort"] = entry.get("thinkingLevel")
+            if entry.get("id"):
+                contexts[entry["id"]] = context
+            contexts["_last"] = context
+            calls = contexts.setdefault("_calls", {})
+            msg = entry.get("message", {})
+            if msg.get("role") == "assistant":
+                for item in msg.get("content", []):
+                    if isinstance(item, dict) and item.get("type") == "toolCall" and item.get("id"):
+                        calls[item["id"]] = digest([entry.get("id"), entry.get("timestamp"), item["id"]])
+            payload = self.extract(entry, context, header, calls, path)
+            if payload:
+                # IDs are short in Pi. Timestamp + role + response/call identity avoid
+                # unrelated ID collisions, without including fork-rewritten parentId/text.
+                msg = entry.get("message", {})
+                key = digest([entry.get("id"), entry.get("timestamp"), entry.get("type"),
+                              msg.get("role"), msg.get("timestamp"), msg.get("responseId"), msg.get("toolCallId")])
+                if not entry.get("id"):
+                    key = digest({k: v for k, v in entry.items() if k != "parentId"})
+                self.put(key, payload)
+                refs.extend(Path(p) for p in payload.get("references", []))
+        self.db.execute("INSERT OR REPLACE INTO files VALUES (?, ?, ?, ?, ?, ?)", (
+            str(path), stamp, end, hashlib.sha256(data[:end]).hexdigest(), packed(header), packed(contexts)))
+        return refs
+
+    def extract(self, entry, context, header, call_ids, session_path):
+        msg = entry.get("message", {})
+        date = day(entry.get("timestamp")) or day(msg.get("timestamp"))
+        if not date:
+            return None
+        observed = timestamp(entry.get("timestamp")) or timestamp(msg.get("timestamp"))
+        payload = {"day": date, "time": observed.timestamp(), "usage": [], "calls": [], "results": [], "summaries": [], "references": []}
+        kind = entry.get("type")
+
+        def add(value, source, category):
+            normalized = usage(value)
+            if normalized is not None:
+                # Summaries/tools need not use the conversation model.
+                fallback = context if category == "assistant" else {}
+                payload["usage"].append({"kind": identity(category, KINDS),
+                    "provider": identity(source.get("provider", fallback.get("provider")), PROVIDERS),
+                    "model": model_name(source.get("model", fallback.get("model"))),
+                    "responseModel": model_name(source.get("responseModel")),
+                    "thinkingLevel": identity(source.get("thinkingLevel", fallback.get("effort")), EFFORTS),
+                    "providerThinkingLevel": identity(source.get("providerThinkingLevel"), EFFORTS),
+                    "tokens": normalized})
+
+        def call(item, nested=False):
+            name = item.get("name")
+            skill = None
+            if name == "read":
+                args = item.get("arguments", {})
+                target = args.get("path", args.get("file_path")) if isinstance(args, dict) else None
+                if isinstance(target, str):
+                    target = Path(target).expanduser()
+                    if not target.is_absolute():
+                        target = Path(header.get("cwd", "/")) / target
+                    resolved = str(target.resolve())
+                    skill = self.mapping.get("skills", {}).get(resolved, self.known_skills.get(resolved))
+            return {"id": call_ids.get(item.get("id"), digest([header.get("id"), item.get("id")])), "tool": identity(name, TOOLS),
+                "extension": self.mapping.get("tools", {}).get(name, "builtin" if name in TOOLS - {"subagent", "subagent_wait", "bg_wait", "web_search", "web_fetch"} else "unknown"),
+                "skill": skill, "nested": nested, "status": item.get("status") if nested else None}
+
+        if kind == "message" and msg.get("role") == "assistant":
+            add(msg.get("usage"), msg, "assistant")
+            for item in msg.get("content", []):
+                if isinstance(item, dict) and item.get("type") == "toolCall":
+                    payload["calls"].append(call(item))
+        elif kind == "message" and msg.get("role") == "toolResult":
+            payload["results"].append({"id": call_ids.get(msg.get("toolCallId"), digest([header.get("id"), msg.get("toolCallId")])), "error": msg.get("isError") is True,
+                "tool": identity(msg.get("toolName"), TOOLS)})
+            nested = msg.get("nestedCalls")
+            payload["coverage"] = ("complete" if nested.get("complete") is True else
+                                   "incomplete" if nested.get("complete") is False else "unrecorded") if isinstance(nested, dict) else "unrecorded"
+            if isinstance(nested, dict):
+                payload["calls"] += [call(c, True) for c in nested.get("calls", []) if isinstance(c, dict)]
+            details = msg.get("details", {})
+            if msg.get("toolName") in ("subagent", "subagent_wait", "bg_wait") and isinstance(details, dict):
+                results = list(details.get("results", []))
+                for completion in details.get("completions", []):
+                    results.extend(completion.get("results", []))
+                for index, result in enumerate(results):
+                    ref = result.get("sessionFile")
+                    if isinstance(ref, str):
+                        ref = Path(ref).expanduser()
+                        if not ref.is_absolute():
+                            ref = session_path.parent / ref
+                        ref = str(ref.resolve())
+                        payload["references"].append(ref)
+                    else:
+                        ref = None
+                    run = result.get("runId") or details.get("runId")
+                    directory = None
+                    if isinstance(run, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,128}", run):
+                        directory = str(session_path.with_suffix("") / run / f"run-{index}")
+                    normalized = usage(result.get("usage"))
+                    if normalized is None and len(results) == 1:
+                        normalized = usage(msg.get("usage"))
+                    if normalized is not None:
+                        payload["summaries"].append({"id": digest([run or result.get("sessionFile") or entry.get("id"), index]),
+                            "refs": [ref] if ref else [], "directories": [directory] if directory else [], "tokens": normalized})
+            if not payload["summaries"] and not payload["references"]:
+                add(msg.get("usage"), msg, "tool")
+        elif kind in ("usage", "compaction", "branch_summary"):
+            add(entry.get("usage"), entry, entry.get("kind", "unknown") if kind == "usage" else kind)
+        return payload if any(payload[k] for k in ("usage", "calls", "results", "summaries", "references")) else None
+
+    def aggregate(self):
+        events = [json.loads(row[0]) for row in self.db.execute("SELECT payload FROM events ORDER BY id")]
+        events.sort(key=lambda e: (e["day"], e.get("time", 0)))
+        sessions = {row[0] for row in self.db.execute("SELECT path FROM files WHERE offset > 0")}
+        directories = defaultdict(list)
+        for path in sessions:
+            directories[str(Path(path).parent)].append(path)
+        results = {r["id"]: r for e in events for r in e.get("results", [])}
+        days = {}
+        summaries = {s["id"]: s for e in events for s in e.get("summaries", [])}
+        represented = {s["id"] for e in events for s in e.get("summaries", [])
+                       if any(ref in sessions for ref in s.get("refs", [s.get("ref")])) or any(
+                           len(directories[d]) == 1 or str(Path(d) / "session.jsonl") in sessions
+                           for d in s.get("directories", []))}
+
+        def bucket(date):
+            return days.setdefault(date, {"models": {}, "tools": {}, "skills": defaultdict(int),
+                "extensions": defaultdict(int), "loadedResources": defaultdict(int),
+                "nestedCoverage": {"complete": 0, "incomplete": 0, "unrecorded": 0}})
+
+        def model(b, item):
+            key = tuple(item[k] for k in DIMENSIONS)
+            target = b["models"].setdefault(key, {**dict(zip(DIMENSIONS, key)),
+                "records": 0, **dict.fromkeys(TOKENS, 0), "cost": dict.fromkeys(COSTS, 0)})
+            target["records"] += 1
+            for field in TOKENS:
+                target[field] += item["tokens"][field]
+            for field in COSTS:
+                target["cost"][field] += item["tokens"]["cost"][field]
+
+        for event in events:
+            b = bucket(event["day"])
+            for item in event.get("usage", []):
+                model(b, item)
+            for item in event.get("summaries", []):
+                if item["id"] not in represented and summaries[item["id"]] is item:
+                    model(b, {**dict.fromkeys(DIMENSIONS, "unknown"), "kind": "subagent_summary", "tokens": item["tokens"]})
+            for c in event.get("calls", []):
+                key = (c["tool"], c["extension"], c["nested"])
+                t = b["tools"].setdefault(key, {"tool": key[0], "extension": key[1], "nested": key[2],
+                    "attempts": 0, "results": 0, "errors": 0, "unfinished": 0})
+                t["attempts"] += 1
+                status = c["status"] if c["nested"] else (
+                    ("error" if results[c["id"]]["error"] else "ok") if c["id"] in results else "unfinished")
+                t["results"] += status in ("ok", "error")
+                t["errors"] += status == "error"
+                t["unfinished"] += status not in ("ok", "error")
+                b["extensions"][c["extension"]] += 1
+                if c["skill"] and status == "ok":
+                    b["skills"][c["skill"]] += 1
+            if event.get("coverage"):
+                b["nestedCoverage"][event["coverage"]] += 1
+            for name, count in event.get("resources", {}).items():
+                b["loadedResources"][name] += count
+        months = {}
+        for date, b in sorted(days.items()):
+            b["models"] = sorted(b["models"].values(), key=packed)
+            for row in b["models"]:
+                denominator = row["input"] + row["cacheRead"] + row["cacheWrite"]
+                row["cacheHitPercent"] = row["cacheRead"] / denominator * 100 if denominator else None
+            b["tools"] = sorted(b["tools"].values(), key=packed)
+            months.setdefault(date[:7], {"schema": 1, "installationId": self.installation,
+                "bucket": "daily-UTC", "days": {}})["days"][date] = b
+        for month, body in months.items():
+            self.db.execute("INSERT OR REPLACE INTO periods VALUES (?, ?)", (month, packed(body)))
+        return months
+
+    def collect(self, inventory=None):
+        # Serialize scanners and senders, including the upload/ack transition.
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            if inventory is None and (self.agent / "vibes-inventory.json").is_file():
+                inventory = self.agent / "vibes-inventory.json"
+            if inventory:
+                self.resource_mapping(inventory)
+            self.scan()
+            result = self.aggregate()
+            self.db.commit()
+            return result
+        except BaseException:
+            self.db.rollback()
+            raise
+
+    def send(self, uploader: GitHub | Http):
+        login, recipient = uploader.identity, uploader.key
+        failed = False
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            for month, body in self.db.execute("SELECT month,body FROM periods ORDER BY month").fetchall():
+                fingerprint = digest(body)
+                row = self.db.execute("SELECT hash FROM sent WHERE login=? AND month=?", (recipient, month)).fetchone()
+                if row and row[0] == fingerprint:
+                    continue
+                document = json.loads(body)
+                document[uploader.field] = login
+                text = packed(document) + "\n"
+                status = uploader.upload(f"usage/{login}/{self.installation}/{month}.json",
+                    lambda existing, text=text: None if existing == text else text)
+                if status:
+                    failed = True
+                else:
+                    self.db.execute("INSERT OR REPLACE INTO sent VALUES (?, ?, ?)", (recipient, month, fingerprint))
+            self.db.commit()
+        except BaseException:
+            self.db.rollback()
+            raise
+        return int(failed)
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("command", choices=("collect", "send"))
+    parser.add_argument("--inventory", type=Path, help="optional raw startup inventory; mapping is cached locally")
+    args = parser.parse_args(argv)
+    agent = Path(os.environ.get("PI_CODING_AGENT_DIR") or Path.home() / ".pi/agent").expanduser().resolve()
+    if load(agent / "settings.json").get("vibesTelemetry") is False:
+        print(packed({"enabled": False, "periods": {}}))
+        return 0
+    collector = Collector(agent)
+    try:
+        periods = collector.collect(args.inventory)
+        if args.command == "collect":
+            print(packed({"enabled": True, "periods": periods}))
+            return 0
+        try:
+            uploader = destination(ROOT, agent)
+        except ValueError as error:
+            print(f"Not sent: {error}.")
+            return 1
+        if uploader is None:
+            print("Not sent: no telemetry destination configured (local-only).")
+            return 0
+        return collector.send(uploader)
+    finally:
+        collector.db.close()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

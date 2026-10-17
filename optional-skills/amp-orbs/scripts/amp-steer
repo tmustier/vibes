@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# Steer a running Amp thread: deliver a message at its next step, not after its turn ends.
+# Usage: amp-steer <thread-id-or-url> <message | @file>
+set -euo pipefail
+[[ $# -eq 2 ]] || { echo "usage: amp-steer <thread-id-or-url> <message | @file>" >&2; exit 2; }
+thread="${1##*/}"
+message="$2"
+[[ "$message" == @* ]] && message="$(cat "${message#@}")"
+log="$HOME/.cache/amp/logs/cli.log"
+nonce="$(date +%s)-$$"
+dir="$(mktemp -d)"
+trap 'rm -rf "$dir"' EXIT
+mkdir -p "$dir/.amp/plugins"
+git -C "$dir" init -q
+cat > "$dir/.amp/plugins/steer.ts" <<'TS'
+import type { PluginAPI } from '@ampcode/plugin'
+
+export const description = 'One-shot: append a steering user message to another Amp thread'
+
+export default function (amp: PluginAPI) {
+	const threadID = process.env.AMP_STEER_THREAD
+	const content = process.env.AMP_STEER_MESSAGE
+	if (!threadID || !content) return
+	amp.on('session.start', async () => {
+		await amp.threads
+			.get(threadID as Parameters<typeof amp.threads.get>[0])
+			.appendUserMessage({ type: 'user-message', content }, { steer: true })
+		amp.logger.log(`steered ${threadID} ${process.env.AMP_STEER_NONCE}`)
+	})
+}
+TS
+(cd "$dir" && AMP_STEER_THREAD="$thread" AMP_STEER_MESSAGE="$message" AMP_STEER_NONCE="$nonce" \
+  amp -x "Reply with: ok" --plugin-ready-timeout 20 >/dev/null)
+if grep -q "steered $thread $nonce" "$log"; then
+  echo "steered $thread"
+else
+  echo "steer not confirmed; see $log (search 'Failed to start plugin')" >&2
+  exit 1
+fi

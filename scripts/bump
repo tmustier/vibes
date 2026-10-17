@@ -1,0 +1,43 @@
+#!/bin/bash
+# Move Pi and every bundled package to its latest release; keep rolling defaults on latest.
+#
+# Maintainer workflow: run this, use the result on your own laptop
+# (`pi install <this checkout>` or the branch), then open a PR. CI checks that Pi starts;
+# after merge, laptops install these versions on `vibes update`, except the two owned rolling defaults.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+before=$(node -p 'JSON.stringify({...require("./package.json").dependencies, ...require("./package.json").devDependencies})')
+
+rm -rf node_modules package-lock.json
+specs=$(node -p 'Object.entries(require("./package.json").dependencies).map(([name, spec]) => spec.startsWith("github:") ? spec : `${name}@${spec.startsWith("file:") ? spec : "latest"}`).join(" ")')
+# shellcheck disable=SC2086
+npm install --save-exact --omit=dev $specs
+pi_dependency_cutoff=$(node -p 'new Date().toISOString()')
+npm install --save-exact --save-dev --omit=dev --before "$pi_dependency_cutoff" @earendil-works/pi-coding-agent@latest @earendil-works/pi-ai@latest
+
+node -e '
+	const before = JSON.parse(process.argv[1]);
+	const pkg = require("./package.json");
+	const lock = require("./package-lock.json");
+	pkg.piDependencyCutoff = process.argv[2];
+	// npm --save-exact pins latest tags too. Preserve the declared rolling policy and keep the
+	// resolved versions in the lock as the snapshot CI tests.
+	for (const [name, spec] of Object.entries(before)) {
+		if (spec !== "latest") continue;
+		pkg.dependencies[name] = "latest";
+		lock.packages[""].dependencies[name] = "latest";
+	}
+	const fs = require("node:fs");
+	fs.writeFileSync("package.json", JSON.stringify(pkg, null, 2) + "\n");
+	fs.writeFileSync("package-lock.json", JSON.stringify(lock, null, 2) + "\n");
+	const after = { ...pkg.dependencies, ...pkg.devDependencies };
+	for (const [name, spec] of Object.entries(after)) {
+		const resolved = spec.startsWith("github:") ? lock.packages[`node_modules/${name}`].resolved.split("#")[1].slice(0, 7) : spec;
+		const was = before[name] ?? "(new)";
+		if (was !== spec || spec.startsWith("github:")) console.log(`${name}: ${was} -> ${resolved}`);
+	}
+' "$before" "$pi_dependency_cutoff"
+
+echo
+echo "Now: python3 tests/startup_check.py, try it yourself, then open a PR."

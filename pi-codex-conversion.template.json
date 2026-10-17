@@ -1,0 +1,29 @@
+{
+  "voiceFeaturesOnly": true,
+  "prompt": {
+    "heavySystemPromptOverwrite": false
+  },
+  "scope": {
+    "allProviders": "off",
+    "additionalProviders": []
+  },
+  "tools": {
+    "webRun": false,
+    "imageGeneration": false,
+    "viewImageFallback": false,
+    "applyPatchOnly": false,
+    "viewImageOnly": false,
+    "webRunOnly": false,
+    "imageGenerationOnly": false
+  },
+  "compaction": {
+    "responsesCompaction": false
+  },
+  "beta": {
+    "codeMode": false,
+    "responsesLite": false
+  },
+  "openai": {
+    "fast": false
+  }
+}

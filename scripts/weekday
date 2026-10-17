@@ -1,0 +1,63 @@
+#!/usr/bin/env python3
+"""Print the weekday for a date, or show the current week.
+
+Usage:
+  weekday              # show current week (Mon-Sun)
+  weekday 2026-03-25   # Wednesday 25 March 2026
+  weekday 26 march     # uses the next occurrence of that date
+  weekday 26 march 2027
+"""
+
+import sys
+from datetime import date, datetime, timedelta
+from typing import Optional
+
+
+HUMAN_FORMATS = (
+    "%d %B %Y",
+    "%d %b %Y",
+    "%B %d %Y",
+    "%b %d %Y",
+    "%B %d, %Y",
+    "%b %d, %Y",
+)
+
+
+def parse_date(raw: str, today: date) -> Optional[date]:
+    for date_format in ("%Y-%m-%d", *HUMAN_FORMATS):
+        try:
+            return datetime.strptime(raw, date_format).date()
+        except ValueError:
+            continue
+
+    for year in range(today.year, today.year + 8):
+        for date_format in HUMAN_FORMATS:
+            try:
+                parsed = datetime.strptime(f"{raw} {year}", date_format).date()
+                if parsed >= today:
+                    return parsed
+            except ValueError:
+                continue
+    return None
+
+
+def main() -> None:
+    today = date.today()
+    if len(sys.argv) == 1:
+        monday = today - timedelta(days=today.weekday())
+        for offset in range(7):
+            current = monday + timedelta(days=offset)
+            marker = " ← today" if current == today else ""
+            print(f"  {current.strftime('%A'):9s} = {current.day} {current.strftime('%B %Y')}{marker}")
+        return
+
+    raw = " ".join(sys.argv[1:])
+    parsed = parse_date(raw, today)
+    if parsed is None:
+        print(f"Could not parse date: {raw}", file=sys.stderr)
+        raise SystemExit(1)
+    print(f"{parsed.strftime('%A')} {parsed.day} {parsed.strftime('%B %Y')}")
+
+
+if __name__ == "__main__":
+    main()
