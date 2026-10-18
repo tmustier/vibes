@@ -42,6 +42,9 @@ export class ThreadState {
 	private pendingAfter?: string;
 	private ignoredQuestions: string[];
 	private failures = 0;
+	// An assistant attempt that streamed an error. Amp may retry it and carry on, so it is a
+	// failure only if the thread then goes idle without any later assistant progress.
+	private failedAttempt = false;
 
 	constructor(threadId: string, origin: string, checkpoint: Checkpoint = {}) {
 		this.pendingAfter = checkpoint.pendingAfter;
@@ -54,6 +57,7 @@ export class ThreadState {
 	}
 	resetConnection() {
 		this.acknowledged = this.snapshot = false;
+		this.failedAttempt = false;
 		this.status = { ...this.status, connection: "connecting", archived: false, state: "unknown", questions: [], approvals: [], error: undefined };
 		this.update();
 	}
@@ -71,7 +75,7 @@ export class ThreadState {
 	rearm() {
 		this.pendingAfter = this.status.messageId ?? "";
 		this.ignoredQuestions = this.status.questions.map((q) => q.requestId);
-		this.armed = true; this.started = false;
+		this.armed = true; this.started = false; this.failedAttempt = false;
 		this.status = { ...this.status, error: undefined, state: "unknown" };
 		this.update();
 	}
@@ -112,10 +116,13 @@ export class ThreadState {
 			s.questions = s.questions.filter((q) => q.requestId !== r.requestId);
 			if (r.status === "pending") { s.questions.push(r); this.armed = true; }
 		}
-		if ((type === "message_added" || type === "message_updated") && p.message.role === "assistant") this.assistant(p.message.messageId, p.message.content, 0, true);
+		if ((type === "message_added" || type === "message_updated") && p.message.role === "assistant") {
+			this.assistant(p.message.messageId, p.message.content, 0, true);
+			this.failedAttempt = false;
+		}
 		if (type === "delta" && p.role === "assistant") {
 			this.assistant(p.messageId, p.blocks, p.blockIndex ?? 0, p.contentMode === "snapshot");
-			if (p.state === "error") s.error = "Amp assistant message failed";
+			this.failedAttempt = p.state === "error";
 		}
 	}
 	private assistant(messageId: string, blocks: Frame[] = [], offset: number, replace: boolean) {
@@ -130,6 +137,7 @@ export class ThreadState {
 	private effectiveQuestions() { return this.status.questions.filter((q) => !this.ignoredQuestions.includes(q.requestId)); }
 	private update() {
 		const s = this.status;
+		if (this.failedAttempt && s.state === "idle") s.error ??= "Amp assistant message failed";
 		for (const question of s.questions) {
 			if (this.humanTools.has(question.invocation?.id)) question.requiresHuman = true;
 		}

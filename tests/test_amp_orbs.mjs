@@ -102,6 +102,24 @@ test("actual runtime error protocol does not become success on idle", () => {
 		assert.equal(s.status.error, "Executor stopped unexpectedly"); assert.equal(s.status.settled, true); assert(s.notification());
 	}
 });
+test("a failed assistant attempt that Amp retries does not wake; one left failed at idle does", () => {
+	const delta = (messageId, state) => event("delta", { role: "assistant", messageId, blocks: [{ type: "text", text: "x" }], contentMode: "snapshot", state });
+	const retried = connected(state());
+	retried.apply(delta("m2", "error"));
+	assert.equal(retried.notification(), false, "a failed attempt while running is not yet a failure");
+	retried.apply(delta("m3", "streaming")); retried.apply(event("agent_state", { state: "running_tools", messageId: "m3" }));
+	assert.equal(retried.status.error, undefined); assert.equal(retried.notification(), false, "the retry carried on");
+	retried.apply(event("agent_state", { state: "idle", messageId: "m3" }));
+	assert.equal(retried.status.error, undefined, "idle after a successful retry is completion, not failure");
+	assert(retried.notification(), "and wakes once as completion");
+
+	const left = connected(state());
+	left.apply(delta("m2", "error")); assert.equal(left.notification(), false);
+	left.apply(event("agent_state", { state: "idle", messageId: "m2" }));
+	assert.equal(left.status.error, "Amp assistant message failed"); assert(left.notification(), "a failure left at idle wakes");
+	assert.equal(left.notification(), false, "and only once");
+});
+
 test("follow-up cannot settle on old question or old idle, including reload before new work", () => {
 	const s = connected(state(), "tool_use", [question]); s.notification(); s.rearm();
 	assert.equal(s.status.settled, false);
