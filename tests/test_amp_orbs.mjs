@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { after, test } from "node:test";
 import { launch, openActor } from "../lib/amp-orbs/connection.ts";
-import { ThreadState } from "../lib/amp-orbs/protocol.ts";
+import { archivedError, ThreadState } from "../lib/amp-orbs/protocol.ts";
 
 const id = "T-00000000-0000-0000-0000-000000000001";
 const ack = { jsonrpc: "2.0", id: 1, result: { replayThroughSeq: 5 } };
@@ -61,6 +61,14 @@ test("authorization and protocol failures wake once, including across reload", (
 		const restored = new ThreadState(id, "https://ampcode.com", s.checkpoint());
 		connected(restored); restored.disconnect(error); assert.equal(restored.notification(), false);
 	}
+});
+
+test("an archived thread settles quietly, and a later reconnect clears it", () => {
+	const s = connected(state(), "tool_use", [question]); assert(s.notification());
+	s.archive();
+	assert.equal(s.status.archived, true); assert.equal(s.status.settled, true, "archiving releases waits");
+	assert.deepEqual(s.status.questions, []); assert.equal(s.notification(), false, "archiving is not a failure");
+	s.resetConnection(); assert.equal(s.status.archived, false);
 });
 
 test("human-only questions and approvals cannot be cancelled by a model reply", () => {
@@ -153,8 +161,8 @@ const replies = [];
 const server = http.createServer((request, response) => {
 	if (request.method === "POST") {
 		authorizations.push(request.headers.authorization);
-		const status = replies.shift();
-		return status === 200 ? response.end(JSON.stringify({ wsToken: "ws", threadVersion: 7 })) : response.writeHead(status).end("private detail");
+		const [status, body = "private detail"] = [replies.shift()].flat();
+		return status === 200 ? response.end(JSON.stringify({ wsToken: "ws", threadVersion: 7 })) : response.writeHead(status).end(body);
 	}
 	response.end('<script>window.x={threadActorConfig:{baseURL:"https://default:public@127.0.0.1:9/actors",poolName:"k8s"}}</script>');
 });
@@ -198,6 +206,14 @@ test("authorization uses the active CLI session, refreshes once through the CLI 
 	const accounts = JSON.parse(fs.readFileSync(path.join(scratch, "amp/accounts.json")));
 	accounts.active[`${origin}/`] = "personal"; write(path.join(scratch, "amp/accounts.json"), accounts); replies.push(200);
 	await openOnce(); assert.deepEqual(authorizations.splice(0), ["Bearer personal"]);
+});
+
+test("only Amp's THREAD_ARCHIVED code marks a thread archived", async () => {
+	replies.push([409, JSON.stringify({ error: "This thread is archived", code: "THREAD_ARCHIVED" })]);
+	await assert.rejects(openOnce(), (error) => error.message === archivedError);
+	replies.push(409);
+	await assert.rejects(openOnce(), (error) => /HTTP 409/.test(error.message) && !error.message.includes("private detail"));
+	authorizations.splice(0);
 });
 
 test("launch passes the literal prompt and options, closes stdin, and returns the canonical thread ID", async () => {

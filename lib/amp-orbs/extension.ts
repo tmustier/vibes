@@ -17,10 +17,20 @@ export default function ampOrbs(pi: ExtensionAPI, { launch = launchOrb, open = o
 		context?.ui.setStatus("amp-orbs", threads.size ? `Amp: ${threads.size} watched${disconnected ? `, ${disconnected} disconnected` : ""}` : undefined);
 	};
 	const save = () => pi.appendEntry<Tracked[]>(entryType, [...threads].map(([threadId, thread]) => ({ threadId, ...thread.state.checkpoint() })));
+	const untrack = (id: string) => {
+		const thread = threads.get(id);
+		thread?.stop();
+		threads.delete(id);
+		save();
+		updateStatus();
+		return Boolean(thread);
+	};
 	const track = (id: string, checkpoint?: Checkpoint) => {
 		const thread = new ThreadConnection(id, checkpoint, open);
 		threads.set(id, thread);
 		thread.subscribe(() => {
+			// An archived thread is finished: stop watching it quietly. A later status read or message re-checks it.
+			if (thread.state.status.archived) { if (threads.get(id) === thread) untrack(id); return; }
 			updateStatus();
 			if (!thread.state.notification()) return;
 			save();
@@ -95,12 +105,7 @@ export default function ampOrbs(pi: ExtensionAPI, { launch = launchOrb, open = o
 		description: "Stop this Pi session's local observer after reviewing an Amp thread's result. Persists across reload. Does not cancel, archive or change remote work. A later status read or message resumes tracking.",
 		parameters: Type.Object({ threadId }),
 		async execute(_id, args) {
-			const thread = threads.get(args.threadId);
-			thread?.stop();
-			threads.delete(args.threadId);
-			save();
-			updateStatus();
-			return result({ threadId: args.threadId, wasTracked: Boolean(thread) });
+			return result({ threadId: args.threadId, wasTracked: untrack(args.threadId) });
 		},
 	});
 	pi.registerTool({
