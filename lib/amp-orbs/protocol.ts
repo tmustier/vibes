@@ -10,6 +10,11 @@ export type ThreadStatus = {
 };
 /** Amp refuses observers for archived threads. Archiving is a deliberate end, not a failure. */
 export const archivedError = "Amp thread is archived";
+// agent-default (not a user rule): 2026-10-18. Consecutive failed connection attempts before a
+// brief server or network error wakes Pi; with reconnect backoff this is about 30 seconds.
+export const persistentFailures = 6;
+// Server-side and network failures that usually clear on their own, so they wake Pi only once persistent.
+const transientError = /^Amp actor (connection failed|authorization failed \(HTTP (429|5\d\d)\))$/;
 export type Checkpoint = { pendingAfter?: string; ignoredQuestions?: string[]; notificationKeys?: string[] };
 
 function notificationKey(identity: unknown): string {
@@ -36,6 +41,7 @@ export class ThreadState {
 	// Set by a send: until a new message appears, the old idle state and these questions are stale.
 	private pendingAfter?: string;
 	private ignoredQuestions: string[];
+	private failures = 0;
 
 	constructor(threadId: string, origin: string, checkpoint: Checkpoint = {}) {
 		this.pendingAfter = checkpoint.pendingAfter;
@@ -56,7 +62,9 @@ export class ThreadState {
 		this.status = { ...this.status, connection: "disconnected", connectionError: archivedError, archived: true, questions: [], approvals: [] };
 		this.update();
 	}
-	disconnect(error: string) {
+	/** failures counts consecutive failed connection attempts, including this one. */
+	disconnect(error: string, failures = 1) {
+		this.failures = failures;
 		this.status = { ...this.status, connection: "disconnected", connectionError: error };
 		this.update();
 	}
@@ -134,6 +142,7 @@ export class ThreadState {
 		if (s.archived) return false;
 		if (s.connection === "disconnected") {
 			if (/^Amp actor (disconnected|transport error|synchronization timed out)$/.test(s.connectionError ?? "")) return false;
+			if (transientError.test(s.connectionError ?? "") && this.failures < persistentFailures) return false;
 			const key = notificationKey(["connection-error", s.messageId, s.connectionError]);
 			if (this.notified.has(key)) return false;
 			this.notified.add(key);
