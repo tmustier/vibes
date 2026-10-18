@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { after, test } from "node:test";
 import { launch, openActor } from "../lib/amp-orbs/connection.ts";
-import { archivedError, ThreadState } from "../lib/amp-orbs/protocol.ts";
+import { archivedError, persistentFailures, ThreadState } from "../lib/amp-orbs/protocol.ts";
 
 const id = "T-00000000-0000-0000-0000-000000000001";
 const ack = { jsonrpc: "2.0", id: 1, result: { replayThroughSeq: 5 } };
@@ -60,6 +60,21 @@ test("authorization and protocol failures wake once, including across reload", (
 		s.resetConnection(); connected(s); s.disconnect(error); assert.equal(s.notification(), false);
 		const restored = new ThreadState(id, "https://ampcode.com", s.checkpoint());
 		connected(restored); restored.disconnect(error); assert.equal(restored.notification(), false);
+	}
+});
+
+test("brief server and network errors stay quiet until they persist, then wake once", () => {
+	for (const error of ["Amp actor authorization failed (HTTP 500)", "Amp actor authorization failed (HTTP 503)", "Amp actor authorization failed (HTTP 429)", "Amp actor connection failed"]) {
+		const s = connected(state());
+		for (let failures = 1; failures < persistentFailures; failures++) {
+			s.disconnect(error, failures); assert.equal(s.notification(), false, `${error} attempt ${failures} is retried quietly`);
+		}
+		s.disconnect(error, persistentFailures); assert(s.notification(), `${error} wakes once it persists`);
+		s.disconnect(error, persistentFailures + 1); assert.equal(s.notification(), false, "a persistent error wakes only once");
+		s.resetConnection(); connected(s); s.disconnect(error, 1); assert.equal(s.notification(), false, "a later brief error after recovery is quiet again");
+	}
+	for (const error of ["Amp actor authorization failed (HTTP 403)", "Amp actor authorization failed (HTTP 409)"]) {
+		const s = connected(state()); s.disconnect(error, 1); assert(s.notification(), `${error} is not transient and wakes at once`);
 	}
 });
 

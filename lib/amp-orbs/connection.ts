@@ -119,11 +119,12 @@ export class ThreadConnection {
 			if (!current()) return;
 			this.stop();
 			const archived = message === archivedError;
-			if (archived) this.state.archive(); else this.state.disconnect(message);
+			const failures = ++this.attempt;
+			if (archived) this.state.archive(); else this.state.disconnect(message, failures);
 			for (const pending of this.pending.values()) pending.reject(new Error("Amp disconnected; message acknowledgement unknown. Read status before retrying."));
 			this.changed();
 			// Reconnect only after a transport failure, never poll idle work or an archived thread.
-			if (!archived) this.retry = setTimeout(() => this.start(), Math.min(30000, 1000 * 2 ** Math.min(this.attempt++, 5)));
+			if (!archived) this.retry = setTimeout(() => this.start(), Math.min(30000, 1000 * 2 ** Math.min(failures - 1, 5)));
 		};
 		const receive = (data: string) => {
 			if (data === "pong") return;

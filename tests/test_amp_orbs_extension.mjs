@@ -111,6 +111,35 @@ assert.equal(sockets.at(-1).sent[0].method, "client_resume", "unwatch never send
 
 await handlers.get("session_tree")({}, { ui, sessionManager: { getBranch: () => [] } });
 assert(sockets.at(-1).closed, "moving to a branch without tracking stops observers");
+// A brief Amp server error while reconnecting is retried quietly.
+{
+	const flakyId = "T-00000000-0000-0000-0000-000000000003";
+	const tools3 = new Map(); const handlers3 = new Map(); const entries3 = []; const messages3 = [];
+	let serverErrors = 1; const opened = [];
+	const open3 = async (threadId, capability) => {
+		opened.push(threadId);
+		if (opened.length > 1 && serverErrors-- > 0) throw new Error("Amp actor authorization failed (HTTP 500)");
+		return open(threadId, capability);
+	};
+	const pi3 = {
+		registerTool(tool) { tools3.set(tool.name, tool); }, on(name, handler) { handlers3.set(name, handler); },
+		appendEntry(customType, data) { entries3.push({ type: "custom", customType, data: structuredClone(data) }); },
+		sendMessage(message, options) { messages3.push({ message, options }); },
+	};
+	const ctx3 = { ui: { setStatus() {} }, sessionManager: { getBranch: () => entries3 } };
+	ampOrbs(pi3, { launch: async () => flakyId, open: open3 });
+	await handlers3.get("session_start")({}, ctx3);
+	snapshot = [{ type: "agent_state", state: "running_tools", messageId: "m1" }, { type: "plugin_message", message: { event: "plugin.ui.snapshot", data: { requests: [] } } }];
+	await tools3.get("create_thread").execute("call", { prompt: "literal", cwd: "/tmp", mode: "low" }, undefined, undefined, ctx3); await tick();
+	sockets.at(-1).dispatchEvent(new Event("close"));
+	await new Promise((resolve) => setTimeout(resolve, 3600)); // the close, then one HTTP 500 (1 s, then 2 s backoff)
+	assert.equal(opened.length, 3, "one failed reconnect, then a successful one");
+	assert.equal(messages3.length, 0, "a brief server error does not wake Pi");
+	const status = JSON.parse((await tools3.get("get_thread_status").execute("call", { threadId: flakyId }, undefined, undefined, ctx3)).content[0].text);
+	assert.equal(status.connection, "connected", "the observer recovered on its own");
+	await handlers3.get("session_shutdown")({}, ctx3);
+}
+
 // Archiving an orb ends tracking quietly: no failure alert, no reconnect loop, nothing restored on reload.
 {
 	const archivedId = "T-00000000-0000-0000-0000-000000000002";
