@@ -4,10 +4,12 @@ import { createHash } from "node:crypto";
 export type Frame = Record<string, any>;
 export type ThreadStatus = {
 	threadId: string; url: string;
-	connection: "connecting" | "connected" | "disconnected"; connectionError?: string;
+	connection: "connecting" | "connected" | "disconnected"; connectionError?: string; archived: boolean;
 	state: string; settled: boolean; agentMode?: string; features: string[];
 	questions: Frame[]; approvals: Frame[]; error?: string; response: string; messageId?: string;
 };
+/** Amp refuses observers for archived threads. Archiving is a deliberate end, not a failure. */
+export const archivedError = "Amp thread is archived";
 export type Checkpoint = { pendingAfter?: string; ignoredQuestions?: string[]; notificationKeys?: string[] };
 
 function notificationKey(identity: unknown): string {
@@ -39,14 +41,19 @@ export class ThreadState {
 		this.pendingAfter = checkpoint.pendingAfter;
 		this.ignoredQuestions = checkpoint.ignoredQuestions ?? [];
 		this.notified = new Set(checkpoint.notificationKeys);
-		this.status = { threadId, url: `${origin}/threads/${threadId}`, connection: "connecting", state: "unknown", settled: false, features: [], questions: [], approvals: [], response: "" };
+		this.status = { threadId, url: `${origin}/threads/${threadId}`, connection: "connecting", archived: false, state: "unknown", settled: false, features: [], questions: [], approvals: [], response: "" };
 	}
 	checkpoint(): Checkpoint {
 		return { pendingAfter: this.pendingAfter, ignoredQuestions: this.ignoredQuestions, notificationKeys: [...this.notified] };
 	}
 	resetConnection() {
 		this.acknowledged = this.snapshot = false;
-		this.status = { ...this.status, connection: "connecting", state: "unknown", questions: [], approvals: [], error: undefined };
+		this.status = { ...this.status, connection: "connecting", archived: false, state: "unknown", questions: [], approvals: [], error: undefined };
+		this.update();
+	}
+	/** Amp refused to observe the thread because it is archived: finished, with nothing to report. */
+	archive() {
+		this.status = { ...this.status, connection: "disconnected", connectionError: archivedError, archived: true, questions: [], approvals: [] };
 		this.update();
 	}
 	disconnect(error: string) {
@@ -118,11 +125,13 @@ export class ThreadState {
 		for (const question of s.questions) {
 			if (this.humanTools.has(question.invocation?.id)) question.requiresHuman = true;
 		}
-		s.settled = s.connection === "connected" && Boolean(s.error || this.effectiveQuestions().length || s.approvals.length || (s.state === "idle" && this.started));
+		s.settled = s.archived || s.connection === "connected" && Boolean(s.error || this.effectiveQuestions().length || s.approvals.length || (s.state === "idle" && this.started));
 	}
 	/** Whether actionable work has not yet been reported. */
 	notification(): boolean {
 		const s = this.status;
+		// Archiving is a deliberate end. A thread archived mid-wait still releases waits via settled.
+		if (s.archived) return false;
 		if (s.connection === "disconnected") {
 			if (/^Amp actor (disconnected|transport error|synchronization timed out)$/.test(s.connectionError ?? "")) return false;
 			const key = notificationKey(["connection-error", s.messageId, s.connectionError]);

@@ -111,4 +111,43 @@ assert.equal(sockets.at(-1).sent[0].method, "client_resume", "unwatch never send
 
 await handlers.get("session_tree")({}, { ui, sessionManager: { getBranch: () => [] } });
 assert(sockets.at(-1).closed, "moving to a branch without tracking stops observers");
+// Archiving an orb ends tracking quietly: no failure alert, no reconnect loop, nothing restored on reload.
+{
+	const archivedId = "T-00000000-0000-0000-0000-000000000002";
+	const tools2 = new Map(); const handlers2 = new Map(); const entries2 = []; const messages2 = []; const statuses2 = [];
+	let archived = false; const opened = [];
+	const open2 = async (threadId, capability) => {
+		opened.push(threadId);
+		if (archived) throw new Error("Amp thread is archived");
+		return open(threadId, capability);
+	};
+	const pi2 = {
+		registerTool(tool) { tools2.set(tool.name, tool); }, on(name, handler) { handlers2.set(name, handler); },
+		appendEntry(customType, data) { entries2.push({ type: "custom", customType, data: structuredClone(data) }); },
+		sendMessage(message, options) { messages2.push({ message, options }); },
+	};
+	const ctx2 = { ui: { setStatus: (key, value) => statuses2.push({ key, value }) }, sessionManager: { getBranch: () => entries2 } };
+	const call2 = async (name, args) => JSON.parse((await tools2.get(name).execute("call", args, undefined, undefined, ctx2)).content[0].text);
+	ampOrbs(pi2, { launch: async () => archivedId, open: open2 });
+	await handlers2.get("session_start")({}, ctx2);
+	snapshot = [{ type: "agent_state", state: "running_tools", messageId: "m1" }, { type: "plugin_message", message: { event: "plugin.ui.snapshot", data: { requests: [] } } }];
+	await call2("create_thread", { prompt: "literal", cwd: "/tmp", mode: "low" }); await tick();
+	assert.equal(entries2.at(-1).data[0].threadId, archivedId);
+	archived = true; sockets.at(-1).dispatchEvent(new Event("close"));
+	await new Promise((resolve) => setTimeout(resolve, 1100)); // past the first reconnect backoff
+	assert.equal(messages2.length, 0, "archiving a watched orb does not raise a failure alert");
+	assert.deepEqual(entries2.at(-1).data, [], "an archived orb is no longer tracked");
+	assert.equal(statuses2.at(-1).value, undefined, "status no longer counts the archived orb");
+	const attempts = opened.length;
+	await new Promise((resolve) => setTimeout(resolve, 2100));
+	assert.equal(opened.length, attempts, "an archived orb is not reconnected");
+	const status = await call2("get_thread_status", { threadId: archivedId });
+	assert.equal(status.archived, true); assert.equal(status.settled, true); assert.equal(status.connectionError, "Amp thread is archived");
+	assert.equal(opened.length, attempts + 1, "an explicit status read re-checks once");
+	assert.deepEqual(entries2.at(-1).data, [], "re-checking an archived orb does not resume tracking");
+	assert.equal((await call2("wait_for_threads", { threads: [archivedId], timeout_seconds: 5 })).timedOut, false, "an archived orb does not hold a wait");
+	await assert.rejects(call2("send_thread_message", { threadId: archivedId, message: "hi" }), /archived/);
+	assert.equal(messages2.length, 0);
+	await handlers2.get("session_shutdown")({}, ctx2);
+}
 console.log("ok: amp-orbs extension");

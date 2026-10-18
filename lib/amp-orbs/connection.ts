@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { ThreadState, type Checkpoint } from "./protocol.ts";
+import { archivedError, ThreadState, type Checkpoint } from "./protocol.ts";
 
 function amp(args: string[], options: ExecFileOptions): Promise<string> {
 	return new Promise((resolve, reject) => {
@@ -43,7 +43,11 @@ export const openActor: OpenActor = async (threadId, capability, signal) => {
 		await amp(["usage"], { signal, timeout: 30000 }).catch(() => { throw new Error("Amp credential refresh failed; run amp login"); });
 		response = await authorize();
 	}
-	if (!response.ok) throw new Error(`Amp actor authorization failed (HTTP ${response.status})`);
+	if (!response.ok) {
+		// Read only Amp's machine-readable code; other error bodies may carry private detail.
+		const code = response.status === 409 ? await response.json().then((body) => body?.code, () => undefined) : undefined;
+		throw new Error(code === "THREAD_ARCHIVED" ? archivedError : `Amp actor authorization failed (HTTP ${response.status})`);
+	}
 	const { wsToken, threadVersion } = await response.json();
 	if (typeof wsToken !== "string" || typeof threadVersion !== "number") throw new Error("Amp actor authorization response changed; update amp-orbs");
 
@@ -114,11 +118,12 @@ export class ThreadConnection {
 		const fail = (message: string) => {
 			if (!current()) return;
 			this.stop();
-			this.state.disconnect(message);
+			const archived = message === archivedError;
+			if (archived) this.state.archive(); else this.state.disconnect(message);
 			for (const pending of this.pending.values()) pending.reject(new Error("Amp disconnected; message acknowledgement unknown. Read status before retrying."));
 			this.changed();
-			// Reconnect only after a transport failure, never poll idle work.
-			this.retry = setTimeout(() => this.start(), Math.min(30000, 1000 * 2 ** Math.min(this.attempt++, 5)));
+			// Reconnect only after a transport failure, never poll idle work or an archived thread.
+			if (!archived) this.retry = setTimeout(() => this.start(), Math.min(30000, 1000 * 2 ** Math.min(this.attempt++, 5)));
 		};
 		const receive = (data: string) => {
 			if (data === "pong") return;
