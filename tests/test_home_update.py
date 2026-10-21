@@ -26,13 +26,32 @@ class HomeUpdateTests(unittest.TestCase):
         for directory in (self.agent, self.bin, seed / "scripts", self.home / ".nvm"):
             directory.mkdir(parents=True, exist_ok=True)
         self.env = {**os.environ, "HOME": str(self.home), "PI_CODING_AGENT_DIR": str(self.agent),
-                    "TEST_BIN": str(self.bin), "TEST_NODE_BIN": str(Path(shutil.which("node")).parent)}
+                    "TEST_BIN": str(self.bin), "TEST_NODE_BIN": str(Path(shutil.which("node")).parent),
+                    "TEST_TRACE": str(self.root / "trace")}
         self.env.pop("VIBES_UPDATE_LOCKED", None)
         self.env.pop("VIBES_CHECK_READY", None)
         (self.home / ".nvm/nvm.sh").write_text(
-            'export PATH="$TEST_BIN:$TEST_NODE_BIN:$PATH"\nnvm() { return 0; }\n')
+            '''export PATH="$TEST_BIN:$TEST_NODE_BIN:$PATH"
+nvm() {
+  printf 'nvm %s\\n' "$*" >>"$TEST_TRACE"
+  if [ "${TEST_NVM_FAIL:-}" = "$1" ]; then return 23; fi
+  case $1 in
+    version-remote) printf 'v%s.12.1\\n' "$2" ;;
+    version) echo v26.12.0 ;;
+    install) return 0 ;;
+    alias) export TEST_NODE_ALIASED=1 ;;
+    use)
+      if [ -n "${TEST_NODE_ALIASED:-}" ]; then
+        [ "${TEST_NVM_FAIL:-}" != use-updated ] || return 23
+        export TEST_NODE_SELECTED=v26.12.1
+      else
+        export TEST_NODE_SELECTED=v26.12.0
+      fi ;;
+  esac
+}
+''')
         for name, content in {
-            "npm": '#!/bin/bash\nexit "${TEST_PACKAGES_EXIT:-0}"\n',
+            "npm": '#!/bin/bash\nprintf "npm %s node=%s\\n" "$*" "$TEST_NODE_SELECTED" >>"$TEST_TRACE"\nexit "${TEST_PACKAGES_EXIT:-0}"\n',
             "pi": '#!/bin/bash\nprintf "1.3.0\\n"\n',
             "launchctl": '#!/bin/bash\nexit 1\n',
         }.items():
@@ -43,6 +62,7 @@ class HomeUpdateTests(unittest.TestCase):
         shutil.copy2(ROOT / "scripts/home-vibes", seed / "scripts/home-vibes")
         (seed / "scripts/vibes").write_text(
             '#!/bin/bash\nsource ' + repr(str(ROOT / "scripts/vibes")) + '\n'
+            'VIBES="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"\n'
             'if [ "${BASH_SOURCE[0]}" = "$0" ]; then\n'
             '  case "$1" in\n'
             '    check) exit "${TEST_STARTUP_EXIT:-0}" ;;\n'
@@ -54,7 +74,7 @@ class HomeUpdateTests(unittest.TestCase):
         (seed / "scripts/sync-settings.mjs").write_text(
             'import { writeFileSync } from "node:fs";\n'
             'writeFileSync(process.argv[4] + "/sync-proof", "ok");\n')
-        for name in ("package.json", "settings.template.json", "subagent-config.template.json", "web-search.template.json"):
+        for name in (".node-version", "package.json", "settings.template.json", "subagent-config.template.json", "web-search.template.json"):
             shutil.copy2(ROOT / name, seed / name)
         self.git(seed, "init", "-q", "-b", "main")
         self.git(seed, "config", "user.name", "Vibes test fixture")
@@ -69,7 +89,7 @@ class HomeUpdateTests(unittest.TestCase):
         return subprocess.check_output(["git", "-C", str(cwd), *args], text=True, stderr=subprocess.STDOUT)
 
     def update(self, **env):
-        return subprocess.run(["bash", str(self.repo / "scripts/home-update")],
+        return subprocess.run(["bash", str(self.repo / "scripts/home-vibes"), "update"],
                               env=self.env | env, capture_output=True, text=True, timeout=20)
 
     def status(self):
@@ -95,6 +115,48 @@ class HomeUpdateTests(unittest.TestCase):
         self.assertIn("succeeded", cli.stdout)
         self.assertIn("startup", cli.stdout)
         self.assertIn(status["log"], cli.stdout)
+
+    def test_node_update_follows_merge_and_precedes_packages(self):
+        # The helper must read the just-fast-forwarded major, not the pre-fetch file.
+        (self.repo / ".node-version").write_text("24\n")
+        self.git(self.repo, "add", ".node-version")
+        self.git(self.repo, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.net",
+                 "commit", "-qm", "Old major")
+        self.git(self.seed, "fetch", str(self.repo), "main")
+        self.git(self.seed, "merge", "--ff-only", "FETCH_HEAD")
+        (self.seed / ".node-version").write_text("26\n")
+        self.git(self.seed, "add", ".node-version")
+        self.git(self.seed, "commit", "-qm", "Roll forward major")
+        self.git(self.seed, "push", "--quiet", str(self.root / "origin.git"), "main")
+        result = self.update()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        names = [s["name"] for s in self.status()["steps"]]
+        self.assertIn("node", names)
+        self.assertLess(names.index("merge"), names.index("node"))
+        self.assertLess(names.index("node"), names.index("packages"))
+        trace = (self.root / "trace").read_text().splitlines()
+        self.assertEqual(trace[:6], ["nvm use --silent default", "nvm version-remote 26",
+            "nvm version default", "nvm install 26 --reinstall-packages-from=v26.12.0",
+            "nvm alias default 26", "nvm use --silent default"])
+        installs = [line for line in trace if line.startswith("npm ")]
+        self.assertEqual(len(installs), 2)
+        self.assertTrue(all(line.endswith("node=v26.12.1") for line in installs), trace)
+
+    def test_actual_node_helper_failure_stops_before_packages(self):
+        # update_node maps these nvm errors to 1, not the boundary's 23. In particular,
+        # run_step must not conditionally invoke the helper and then mask its return.
+        for operation in ("version-remote", "install", "alias", "use-updated"):
+            with self.subTest(operation=operation):
+                (self.root / "trace").write_text("")
+                result = self.update(TEST_NVM_FAIL=operation)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                status = self.status()
+                self.assertFalse(status["ok"])
+                self.assertEqual(status["steps"][-1],
+                                 {"name": "node", "ok": False, "detail": "exit 1"})
+                self.assertNotIn("packages", [s["name"] for s in status["steps"]])
+                self.assertFalse(any(line.startswith("npm ") for line in
+                                     (self.root / "trace").read_text().splitlines()))
 
     def test_logging_failure_replaces_the_previous_success(self):
         self.assertEqual(self.update().returncode, 0)
