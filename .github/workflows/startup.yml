@@ -24,6 +24,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version-file: .node-version
+          check-latest: true
           cache: npm
       - run: npm install -g npm@latest
       - run: npm install -g --before "$(node -p 'require("./package.json").piDependencyCutoff')" "@earendil-works/pi-coding-agent@$(node -p 'require("./package.json").devDependencies["@earendil-works/pi-coding-agent"]')"
@@ -34,6 +35,7 @@ jobs:
       # Type checking and unit tests also need dev dependencies, including the pinned Pi.
       - run: npm install
       - run: npm run typecheck
+      - run: python3 tests/test_node_version.py
       - run: python3 tests/test_public_release.py
       - run: npx jiti tests/test_bundled.mjs
       - run: npx jiti tests/test_features.mjs

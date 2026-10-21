@@ -97,6 +97,7 @@ run_step checkout check_clean
 run_step templates save_templates
 run_step fetch git -C "$repo" fetch --quiet origin main
 run_step merge git -C "$repo" merge --ff-only origin/main
+run_step node update_node
 run_step packages packages
 run_step settings node "$repo/scripts/sync-settings.mjs" "$previous" "$repo" "$AGENT_DIR"
 run_step pi install_pi
