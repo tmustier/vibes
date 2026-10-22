@@ -64,8 +64,7 @@ with tempfile.TemporaryDirectory(prefix="vibes-feature-startup-") as scratch:
     else:
         raise AssertionError("Pi accepted an unknown feature")
     config.write_text(json.dumps({"features": {"cachemire": True, "meantime": True, "surf": False}}))
-    native_config = Path(scratch, "home", ".pi", "agent", "pi-meantime.json")
-    native_config.parent.mkdir(parents=True)
+    native_config = agent / "pi-meantime.json"
     native_config.write_text(json.dumps({"enabled": True}))
     activated = commands(agent, project)
     assert {"cache", "pace"} <= activated
