@@ -50,9 +50,10 @@ nvm() {
   esac
 }
 ''')
+        pinned_pi = json.loads((ROOT / "package.json").read_text())["devDependencies"]["@earendil-works/pi-coding-agent"]
         for name, content in {
             "npm": '#!/bin/bash\nprintf "npm %s node=%s\\n" "$*" "$TEST_NODE_SELECTED" >>"$TEST_TRACE"\nexit "${TEST_PACKAGES_EXIT:-0}"\n',
-            "pi": '#!/bin/bash\nprintf "1.3.0\\n"\n',
+            "pi": f'#!/bin/bash\nprintf "{pinned_pi}\\n"\n',
             "launchctl": '#!/bin/bash\nexit 1\n',
         }.items():
             path = self.bin / name

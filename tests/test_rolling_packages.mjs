@@ -113,8 +113,19 @@ try {
 	const bumpRepo = path.join(scratch, "bump");
 	fs.mkdirSync(path.join(bumpRepo, "scripts"), { recursive: true });
 	fs.copyFileSync(path.join(root, "scripts", "bump"), path.join(bumpRepo, "scripts", "bump"));
-	fs.writeFileSync(path.join(bumpRepo, "package.json"), JSON.stringify(manifest));
-	fs.copyFileSync(path.join(sourceRepo, ".npmrc"), path.join(bumpRepo, ".npmrc"));
+	// A pinned fork must not silently become an unrelated registry package at @latest.
+	const gitRepo = path.join(scratch, "pinned-git");
+	fs.mkdirSync(gitRepo);
+	fs.writeFileSync(path.join(gitRepo, "package.json"), JSON.stringify({ name: "pinned-git-fixture", version: "1.0.0" }));
+	await run("git", ["init", "-q"], gitRepo);
+	await run("git", ["add", "."], gitRepo);
+	await run("git", ["-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-qm", "pinned fork"], gitRepo);
+	const gitCommit = (await run("git", ["rev-parse", "HEAD"], gitRepo)).stdout.trim();
+	const gitSpec = `git+https://github.com/vibes-test/pinned.git#${gitCommit}`;
+	await run("git", ["config", "--global", `url.file://${gitRepo}.insteadOf`, "https://github.com/vibes-test/pinned.git"]);
+	fs.writeFileSync(path.join(bumpRepo, "package.json"), JSON.stringify({ ...manifest,
+		dependencies: { ...manifest.dependencies, "pinned-git-fixture": gitSpec } }));
+	fs.writeFileSync(path.join(bumpRepo, ".npmrc"), "legacy-peer-deps=true\nallow-git=root\n");
 	await run("bash", ["scripts/bump"], bumpRepo);
 	const bumped = JSON.parse(fs.readFileSync(path.join(bumpRepo, "package.json")));
 	const bumpedLock = JSON.parse(fs.readFileSync(path.join(bumpRepo, "package-lock.json")));
@@ -126,6 +137,9 @@ try {
 		assert.equal(bumpedLock.packages[`node_modules/${name}`].version, versions[1]);
 	}
 	assert.equal(bumped.dependencies["pinned-fixture"], versions[1], "ordinary bump still pins releases");
+	assert.equal(bumped.dependencies["pinned-git-fixture"], gitSpec, "bump preserves the pinned fork source");
+	assert.equal(bumpedLock.packages[""].dependencies["pinned-git-fixture"], gitSpec);
+	assert.ok(bumpedLock.packages["node_modules/pinned-git-fixture"].resolved.endsWith(`#${gitCommit}`));
 	for (const key of Object.keys(process.env)) if (!(key in savedEnv)) delete process.env[key];
 	Object.assign(process.env, savedEnv);
 	console.log("ok: real Pi install/update, unchanged source, nightly rolling refresh, locked unrelated dependencies, unchanged settings/manifests, bump policy");
