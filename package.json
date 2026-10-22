@@ -26,7 +26,7 @@
     "pi-subagents": "0.80.0",
     "pi-web-access": "0.44.0",
     "pi-you-should-know": "git+https://github.com/tmustier/pi-you-should-know.git#4ffceda99b625b633a1ea4fd0a253740947759da",
-    "pine-of-glass": "0.18.1",
+    "pine-of-glass": "0.18.3",
     "read-agent-instructions": "git+https://github.com/tmustier/read-agent-instructions.git",
     "surf-cli": "2.22.0"
   },
