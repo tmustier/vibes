@@ -1,5 +1,5 @@
 #!/bin/bash
-# Move Pi and every bundled package to its latest release; keep rolling defaults on latest.
+# Move Pi and bundled registry packages to latest; preserve reviewed Git refs and rolling defaults.
 #
 # Maintainer workflow: run this, use the result on your own laptop
 # (`pi install <this checkout>` or the branch), then open a PR. CI checks that Pi starts;
@@ -10,7 +10,7 @@ cd "$(dirname "$0")/.."
 before=$(node -p 'JSON.stringify({...require("./package.json").dependencies, ...require("./package.json").devDependencies})')
 
 rm -rf node_modules package-lock.json
-specs=$(node -p 'Object.entries(require("./package.json").dependencies).map(([name, spec]) => spec.startsWith("github:") ? spec : `${name}@${spec.startsWith("file:") ? spec : "latest"}`).join(" ")')
+specs=$(node -p 'Object.entries(require("./package.json").dependencies).map(([name, spec]) => spec.startsWith("github:") ? spec : `${name}@${spec.startsWith("file:") || spec.startsWith("git+https:") ? spec : "latest"}`).join(" ")')
 # shellcheck disable=SC2086
 npm install --save-exact --omit=dev $specs
 pi_dependency_cutoff=$(node -p 'new Date().toISOString()')
