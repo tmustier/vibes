@@ -128,6 +128,12 @@ Open a new terminal and run `pi --help`. It should list `--park-after`. Restart 
 
 Parking remains opt-in. Do not replace the npm `pi` executable or change PATH ordering for other programs. Slack and Pinet connections still prevent automatic parking.
 
+### Rex shows the shell icon and title for Pi
+
+Older versions of `scripts/pi-park` kept the launcher as the terminal's foreground process. Rex then showed `zsh` even while Pi ran. The launcher now gives Pi its own foreground process group and takes the terminal back only when Pi exits or parks. Piped invocations keep their existing behaviour, and no additional user shell startup files load.
+
+Update Vibes and restart through the launcher to use the change. `/reload` cannot change a running launcher's process handling. Rex should show the Pi icon and the title Pi sends. A title extension such as `tab-status` can still replace the session name with a folder and run status; the launcher leaves those choices alone.
+
 ## Fast mode from an older Vibes
 
 Vibes now owns `extensions/fast-mode.ts`, including `/fast ultrafast`. A separate `@linioi/pi-fast-mode` install still takes precedence: Vibes leaves `/fast` to it and reports how to migrate. Unless the user has explicitly opted out, back up settings and remove the separate entry with `pi remove npm:@linioi/pi-fast-mode` (or its actual source from `pi list`) and reload. Check trusted projects for their own copies too. Keep `~/.pi/agent/fast-mode.json`: Vibes reads the old `enabled` preference. Existing exclusions of `extensions/fast-mode.ts` still work.
