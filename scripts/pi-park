@@ -7,6 +7,16 @@
 # on PATH that is not itself, so it survives npm global upgrades.
 emulate -L zsh
 
+# zsh only hands the terminal to foreground jobs in interactive mode. Re-enter
+# without startup files, and enable job control without changing piped calls.
+if [[ -t 0 && -t 1 ]]; then
+	if [[ ! -o interactive ]]; then
+		exec /bin/zsh -d -f -i "$0" "$@"
+	fi
+	setopt monitor
+	zmodload zsh/parameter
+fi
+
 self="${0:A}"
 real_pi=""
 for dir in $path; do
@@ -36,8 +46,12 @@ cleanup() {
 }
 
 while true; do
-	"$real_pi" "${args[@]}"
-	status_code=$?
+	source "${self:h}/lib/pi-park-run.zsh"
+	# Let the user's shell suspend/resume the launcher, then resume the same Pi.
+	while [[ ${(j: :)${(v)jobstates}} == *suspended:* ]]; do
+		kill -s STOP "$$"
+		source "${self:h}/lib/pi-park-run.zsh"
+	done
 	if [[ ! -s "$PI_PARK_FILE" ]]; then
 		rm -f -- "$PI_PARK_FILE" "$wake_file" "$draft_file"
 		exit $status_code

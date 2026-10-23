@@ -49,6 +49,7 @@ jobs:
       - run: node tests/test_cache_safe_prompts.mjs
       - run: node tests/test_wut.mjs
       - run: node tests/test_park.mjs
+      - run: python3 -m unittest discover -s tests -p test_park_terminal.py
       - run: node tests/test_fast_mode.mjs
       - run: node --test tests/test_granola_mcp_fetch.mjs
       - run: bash tests/test_home_command.sh
