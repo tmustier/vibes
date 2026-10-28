@@ -213,7 +213,7 @@ assert(sockets.at(-1).closed, "moving to a branch without tracking stops observe
 	await handlers2.get("session_shutdown")({}, ctx2);
 }
 
-// The 21 October storm: while Pi worked, every orb update joined Pi's follow-up queue; once Pi's model
+// While Pi worked, every orb update could join Pi's follow-up queue; once Pi's model
 // hit a rate limit, each queued update started its own failing turn. Updates now wait in the
 // extension, go out together when Pi is idle, skip what Pi already read, and hold after a model error.
 {
@@ -379,6 +379,34 @@ await test("reload retains an observed new episode without repeating a read or d
 	await session.call("stop_tracking_thread", { threadId: id }); await session.stop();
 	session = wakeSession(session.entries); await session.start(); await advance();
 	assert.equal(session.messages.length, 0, "reload never restores stopped tracking");
+});
+
+await test("cold restore checkpoints input boundaries without requiring an observed working transition", async (t) => {
+	const user = (messageId) => ({ type: "message_added", message: { role: "user", messageId, content: [{ type: "text", text: "Task" }] } });
+	let session = wakeSession(); t.after(async () => session.stop());
+	snapshot = [user("input-A"), ...replay("idle", "answer-A", "FIRST")];
+	await session.start();
+	assert.equal((await session.call("get_thread_status", { threadId: id })).response, "FIRST");
+	const saved = () => session.entries.findLast((entry) => entry.customType === "amp-orbs-tracking").data[0];
+	assert.equal(saved().userMessageId, "input-A", "reading also persists the input boundary");
+	await session.stop();
+	// The entire new task is present only in replay; no working event was ever observed.
+	snapshot = [user("input-A"), ...replay("idle", "answer-A", "FIRST").slice(1), user("input-B"), ...replay("idle", "answer-B", "SECOND")];
+	session = wakeSession(session.entries); await session.start();
+	await waitUntil(() => session.messages.length > 0);
+	assert.equal(session.messages.length, 1); assert.match(session.messages[0].content, /SECOND/);
+	assert.equal(saved().userMessageId, "input-B");
+	await session.stop();
+	session = wakeSession(session.entries); await session.start(); await tick(); await tick();
+	assert.equal(session.messages.length, 0, "full history does not repeat the last result");
+	session.event([user("input-C")]);
+	assert.equal(saved().userMessageId, "input-C", "a queued input is persisted before its assistant starts");
+	assert.equal((await session.call("get_thread_status", { threadId: id })).settled, false);
+	await session.stop();
+	snapshot = [...snapshot.slice(0, -2), user("input-C"), ...replay("idle", "answer-C", "THIRD")];
+	session = wakeSession(session.entries); await session.start();
+	await waitUntil(() => session.messages.length > 0);
+	assert.equal(session.messages.length, 1); assert.match(session.messages[0].content, /THIRD/);
 });
 
 await test("reload preserves hold deadlines and the 5, 15, 60, 60 progression", async (t) => {
