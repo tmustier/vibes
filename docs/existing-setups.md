@@ -142,6 +142,12 @@ Vibes now owns `extensions/fast-mode.ts`, including `/fast ultrafast`. A separat
 
 Vibes used to bundle Pi Dial for subagents; it now bundles pi-subagents. A personal `@tmustier/pi-dial` entry in `settings.json` still loads Pi Dial alongside it, with its own `oracle` and `Task` tools. Remove the entry unless the user wants Pi Dial on purpose. Model switching moves to ⌘P, and ⇧Tab raises the thinking level. `/wut` is now part of Vibes: move any personal copy in `~/.pi/agent/extensions/` to the Trash, or Pi lists `/wut` twice.
 
+## Claude artifact skill from an older Vibes
+
+The `claude-artifacts` feature replaces the old opt-in `optional-skills/claude-code-artifact` skill and its publishing scripts with Claude Code's own tools. Back up `~/.pi/agent/settings.json`, then remove any skill entry pointing to that old directory. Do not add a separate MCP server for the new feature.
+
+Run `claude auth status` to check the Claude Code login, or `claude auth login` to sign in, then reload Pi. See [Claude artifact tools](claude-artifacts.md) for requirements, features and limitations.
+
 ## Oracle fails with "Agent is already processing"
 
 A forked Oracle copies the parent's active goal, and the goal extension continues it during child startup, before the Oracle's task arrives. Vibes now starts Oracle fresh (`defaultContext: "fresh"` in `settings.template.json`) and gives it the parent session's JSONL path to read when it needs history.

@@ -41,6 +41,7 @@ jobs:
       - run: npx jiti tests/test_features.mjs
       - run: node --test tests/test_amp_orbs.mjs
       - run: npx jiti tests/test_amp_orbs_extension.mjs
+      - run: npx jiti tests/test_claude_artifacts.mjs
       - run: node tests/test_tips.mjs
       - run: node tests/test_send_approval.mjs
       - run: node tests/test_update_status.mjs

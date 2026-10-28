@@ -32,6 +32,12 @@ Run `vibes features` to list feature names and defaults. The initial home profil
 
 See [existing setups](docs/existing-setups.md), [fast mode](docs/fast-mode.md) and the package guides for [browser tools](packages/pi-browser/README.md) and [request compression](packages/pi-anthropic-gzip/README.md).
 
+## Claude artifacts
+
+Ask Pi to publish a page on claude.ai, update an existing artifact, read its comments or use its shared database. The tools load when needed and require Claude Code on `PATH`, signed in with `claude auth login` to an account with artifacts enabled. Without Claude Code, the feature adds nothing.
+
+Set `"claude-artifacts": false` in your feature choices to disable it. See [Claude artifact tools](docs/claude-artifacts.md) for details and limitations, or [existing setups](docs/existing-setups.md#claude-artifact-skill-from-an-older-vibes) if you used the old publishing skill.
+
 ## Idle parking
 
 Parking is optional and needs the launcher as well as the extension. To enable it, add this alias to `~/.zshrc`, adjusting the path if your clone lives elsewhere:
