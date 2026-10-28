@@ -69,15 +69,23 @@ function startClaudeCode(cwd: string, env: NodeJS.ProcessEnv): ClaudeCode {
 		cwd,
 		running: () => child.exitCode === null && child.signalCode === null,
 		async request<T>(method: Method, params: object, signal?: AbortSignal) {
-			await ready;
 			let timer: NodeJS.Timeout | undefined;
+			let cancel: () => void;
 			const stop = new Promise<never>((_, fail) => {
 				timer = setTimeout(() => fail(new Error(`Claude Code did not answer within ${CALL_TIMEOUT_MS / 1000} seconds`)), CALL_TIMEOUT_MS);
-				const cancel = () => fail(new Error("Cancelled"));
+				cancel = () => fail(new Error("Cancelled"));
 				if (signal?.aborted) cancel();
 				else signal?.addEventListener("abort", cancel, { once: true });
 			});
-			return Promise.race([request<T>(method, params), stop]).finally(() => clearTimeout(timer));
+			try {
+				return await Promise.race([ready.then(() => {
+					signal?.throwIfAborted();
+					return request<T>(method, params);
+				}), stop]);
+			} finally {
+				clearTimeout(timer);
+				signal?.removeEventListener("abort", cancel!);
+			}
 		},
 		close: () => child.kill(),
 	};
@@ -311,9 +319,9 @@ export default function claudeArtifacts(
 			deleted.set(event.toolCallId, { url, id });
 			return;
 		}
-		if ((input.action ?? "publish") !== "publish" || input.type_url !== undefined) return;
+		if ((input.action ?? "publish") !== "publish" || input.type_url != null) return;
 		// The same file redeploys to the same artifact, as the tool's description promises.
-		if (input.url === undefined && typeof input.file_path === "string") {
+		if (input.url == null && typeof input.file_path === "string") {
 			// Claude Code reports the real path (on macOS, /tmp is /private/tmp).
 			const file = resolve(ctx.cwd, input.file_path);
 			const url = publishedFiles.get(await realpath(file).catch(() => file));
@@ -333,7 +341,7 @@ export default function claudeArtifacts(
 		}
 		if (live.version !== seenVersions.get(id)) unseenLive.set(event.toolCallId, { id, version: live.version });
 		else input.force = true;
-		if (input.files === undefined && input.root === undefined) return;
+		if (input.files == null && input.root == null) return;
 		const seen = seenFiles.get(id);
 		const unchanged = Object.entries(live.files).filter(([path, sha256]) => seen?.get(path) === sha256).map(([path]) => path);
 		if (unchanged.length) input.overwrite_unread = [...new Set([...(input.overwrite_unread ?? []), ...unchanged])];

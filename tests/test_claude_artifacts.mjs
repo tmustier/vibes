@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { mock } from "node:test";
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
@@ -27,7 +28,7 @@ process.stdin.on("data", (chunk) => {
 	buffer += chunk;
 	for (let at; (at = buffer.indexOf("\\n")) >= 0; buffer = buffer.slice(at + 1)) {
 		const { id, method, params } = JSON.parse(buffer.slice(0, at));
-		if (method === "initialize") send({ id, result: {} });
+		if (method === "initialize" && !process.env.HANG_INITIALIZE) send({ id, result: {} });
 		if (method === "tools/list") send({ id, result: { tools: [${JSON.stringify(tool("Artifact"))}, ...(process.env.SIGNED_OUT ? [] : [${JSON.stringify(tool("ArtifactComments"))}, ${JSON.stringify(tool("ArtifactData"))}]), { name: "Bash", description: "x", inputSchema: {} }] } });
 		if (method === "tools/call" && params.arguments.action === "hang") continue;
 		if (method === "tools/call") fs.appendFileSync(${JSON.stringify(path.join(claudeBin, "calls"))}, JSON.stringify(params) + "\\n");
@@ -123,6 +124,39 @@ assert.equal(await withOptions("--max-old-space-size=4096"), "--max-old-space-si
 assert.equal(await withOptions("--use-openssl-ca --max-old-space-size=4096"), "--max-old-space-size=4096");
 assert.equal(await withOptions("--use-openssl-ca"), "");
 
+// Cancellation and the call timeout also cover a server that never finishes initialization.
+const stalled = load({ env: { HANG_INITIALIZE: "1" } });
+await stalled.handlers.get("tool_call")({ toolName: "tool_search", toolCallId: "stalled", input: {} }, { cwd: "/" });
+const startupCancel = new AbortController();
+let startupError;
+const initializing = stalled.tools.get(TOOL).execute("startup-cancel", {}, startupCancel.signal, undefined, { cwd: callDir }).catch((error) => { startupError = error; });
+startupCancel.abort();
+try {
+	assert(await until(() => startupError), "cancellation must not wait for initialization");
+	assert.match(startupError.message, /Cancelled/);
+	await initializing;
+} finally {
+	stalled.handlers.get("session_shutdown")();
+}
+const beforeTimeout = starts().length;
+const timeoutStarted = new Promise((resolve) => {
+	const watcher = fs.watch(path.join(claudeBin, "starts"), () => {
+		if (starts().length > beforeTimeout) { watcher.close(); resolve(); }
+	});
+});
+mock.timers.enable({ apis: ["setTimeout"] });
+try {
+	const timed = stalled.tools.get(TOOL).execute("startup-timeout", {}, undefined, undefined, { cwd: callDir });
+	const rejected = assert.rejects(timed, /did not answer within 300 seconds/);
+	await timeoutStarted;
+	mock.timers.tick(300_000);
+	await rejected;
+} finally {
+	mock.timers.reset();
+	stalled.handlers.get("session_shutdown")();
+}
+assert(await until(() => !running(starts().at(-1)[0])), "a timed-out startup is closed");
+
 // tool_search is turned on, and the system prompt names the tools in one stable line.
 handlers.get("session_start")({});
 assert(active().includes("tool_search"));
@@ -205,6 +239,13 @@ const redeploy = await publish({ file_path: "page.html", edits: [] }, { ...publi
 assert.equal(redeploy.url, url, "the same file redeploys to the same artifact");
 assert.equal(redeploy.force, true, "the version this conversation published is still live");
 assert.deepEqual(versionChecks, [uuid]);
+for (const nulls of [{ type_url: null }, { url: null }, { type_url: null, url: null, files: null, root: null }]) {
+	live.set(uuid, "2-b");
+	const nullable = await publish({ file_path: "page.html", ...nulls }, { ...published, version: "2-b" }, "nullable");
+	assert.equal(nullable.url, url, "null optional values still redeploy the same file");
+	assert.equal(nullable.force, true, "null optional values still track the viewed version");
+	assert.equal(nullable.overwrite_unread, undefined, "null file options do not make a multi-file publish");
+}
 live.set(uuid, "3-c");
 const outdated = await publish({ file_path: "/work/page.html" }, undefined, "p3");
 assert.equal(outdated.url, url);
@@ -307,7 +348,9 @@ assert.equal(multiUpdate.force, undefined, "version 9 is newer than the 8 this c
 assert.deepEqual(multiUpdate.overwrite_unread, ["c.png", "a.js", "index.html"], "only files seen unchanged are added; b.css changed and a failed read does not erase the index.html hash");
 await multiCall({ action: "read", url, path: "b.css" }, JSON.stringify({ file_read: { url, path: "b.css", sha256: "sha-b2" } }), "m5");
 assert(( await multiCall({ url, file_path: "m.html", files: { "b.css": "b.css" } }, "refused", "m6", true)).overwrite_unread.includes("b.css"), "a file read counts as seen");
-assert.equal((await multiCall({ url, file_path: "m.html" }, "refused", "m7", true)).overwrite_unread, undefined, "a single-file publish gets no file list");
+for (const nulls of [{}, { files: null }, { root: null }, { files: null, root: null, type_url: null }]) {
+	assert.equal((await multiCall({ url, file_path: "m.html", ...nulls }, "refused", "m7", true)).overwrite_unread, undefined, "absent or null file options are a single-file publish");
+}
 
 // After a delete, publishing the same file again creates a new artifact.
 const removing = load({ env: {}, deleteArtifact: async () => {}, liveArtifact: async () => ({ version: "1", files: {} }) }).handlers;
