@@ -58,6 +58,10 @@ The home updater writes `~/.pi/agent/vibes-update.json` with `updater: "home"`, 
 
 `vibes check` starts Pi in a hidden tmux session. Behaviour changes also need a real prompt and tool call. If Granola times out despite a valid login, see the [compatibility fix](docs/granola-mcp.md).
 
+### Codex Notes migration
+
+Codex Conversion 4.0.5 removes its built-in Notes/history and legacy Remote mode. Existing Notes configurations can block turns, including in voice-only mode. Follow the upgrade message: install and enable `@howaboua/pi-notes-compaction`, or explicitly choose ordinary compaction in the indicated configuration file. The updater does not make that choice for you.
+
 ## Privacy
 
 There is no default telemetry destination. Inventory and usage tools can collect local data; remote uploads require an explicitly configured destination. Inventory can include the text of your own extensions, skills and prompts. Review it before choosing a destination, and use a private repository or receiver. See [telemetry destinations](docs/telemetry-destinations.md) and [usage telemetry](docs/usage-telemetry.md). Set `"vibesTelemetry": false` in personal settings to disable collection and uploads.

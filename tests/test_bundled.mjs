@@ -7,11 +7,15 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { DefaultPackageManager, SettingsManager } from "@earendil-works/pi-coding-agent";
+import { bundled } from "../lib/bundled.ts";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
 const load = async (name) => (await import(pathToFileURL(path.join(root, "extensions", `${name}.ts`)))).default;
 const extendingPi = await load("extending-pi"); // pi-extensions: skills only
+// Surf retains two skills after pi-extensions retired its nested skill-creator. Exercise
+// partial skill overlap without running Surf's unrelated extension in this unit fixture.
+const surfSkills = bundled(new URL("../extensions/surf.ts", import.meta.url).href, { package: "surf-cli", skills: ["skills/surf/SKILL.md", "skills/deep-x-research/SKILL.md"], noExtensions: true });
 const tmux = await load("tmux"); // mitsupi: the tmux skill only
 const whimsical = await load("whimsical"); // mitsupi: one extension entry
 assert.equal(fs.existsSync(path.join(root, "extensions", "notify.ts")), false, "completion popup is not bundled");
@@ -51,6 +55,16 @@ const install = (dir, name = "pi-extensions") => {
 };
 const gitInstall = (repo = "tmustier/pi-extensions", name) => () => install(path.join(agentDir, "git", "github.com", repo), name);
 const projectInstall = () => install(path.join(project, ".pi", "npm", "node_modules", "pi-extensions"));
+const surfSource = "git:github.com/nicobailon/surf-cli";
+const surfInstall = () => {
+	const dir = path.join(agentDir, "git", "github.com", "nicobailon", "surf-cli");
+	for (const name of ["surf", "deep-x-research"]) {
+		const skill = path.join(dir, "skills", name, "SKILL.md");
+		fs.mkdirSync(path.dirname(skill), { recursive: true });
+		fs.writeFileSync(skill, `---\nname: ${name}\ndescription: test\n---\n`);
+	}
+	fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "surf-cli", pi: { skills: ["skills"] } }));
+};
 
 // Loads a wrapper as Pi's pre-trust pass does, with these settings (after `setup` fakes any
 // installs), and returns what it registered.
@@ -123,7 +137,7 @@ const withArgs = async (args, run) => {
 
 // No personal copy: the bundled skills load and exist.
 const own = await skills(await start(extendingPi));
-assert.equal(own.length, 2);
+assert.equal(own.length, 1);
 for (const skill of own) assert.ok(fs.existsSync(skill), skill);
 
 // Every way of installing the same package makes the bundled copy step aside.
@@ -151,7 +165,7 @@ const pinetOnly = { global: [{ source: pinet, extensions: ["slack-bridge/dist/in
 const withPinet = await start(codeActions, pinetOnly, pinetInstall);
 assert.ok(withPinet.other > 0, "same-name unrelated Pinet leaves /code bundled");
 const pinetSkills = await reload(extendingPi);
-assert.equal((await skills(pinetSkills)).length, 2, "Pinet leaves bundled skills");
+assert.equal((await skills(pinetSkills)).length, 1, "Pinet leaves bundled skills");
 assert.deepEqual(await sessionStart(withPinet, true), [], "unrelated same-name package isn't a duplicate");
 const codeCopyInstall = () => {
 	gitInstall()();
@@ -168,8 +182,9 @@ assert.equal((await start(codeActions, { global: [codeCopy] }, codeCopyInstall))
 assert.ok((await start(codeActions, { global: [{ ...codeCopy, extensions: ["!code-actions/index.ts"] }] }, codeCopyInstall)).other > 0, "excluded personal module leaves Vibes in place");
 
 // A copy that loads only some of the bundled skills: the rest still load from the bundle.
-const partial = await start(extendingPi, { global: [{ source: "git:github.com/tmustier/pi-extensions", skills: ["extending-pi/SKILL.md"] }] }, gitInstall());
-assert.deepEqual((await skills(partial)).map((file) => path.relative(path.join(root, "node_modules", "pi-extensions"), file)), [path.join("extending-pi", "skill-creator", "SKILL.md")]);
+assert.equal((await skills(await start(surfSkills))).length, 2, "Surf supplies a real two-skill bundle");
+const partial = await start(surfSkills, { global: [{ source: surfSource, skills: ["skills/surf/SKILL.md"] }] }, surfInstall);
+assert.deepEqual((await skills(partial)).map((file) => path.relative(path.join(root, "node_modules", "surf-cli"), file)), [path.join("skills", "deep-x-research", "SKILL.md")]);
 
 // Resuming a session from another folder loads extensions for the session's folder, not the
 // process's: the bundled copy steps aside there only for that folder's own copy.
@@ -184,7 +199,7 @@ const resume = async (from, loadFor) => {
 	return (await skills(previous)).length;
 };
 assert.equal(await resume(elsewhere, project), 0, "session in the project, resumed from elsewhere");
-assert.equal(await resume(project, elsewhere), 2, "session elsewhere, resumed from the project");
+assert.equal(await resume(project, elsewhere), 1, "session elsewhere, resumed from the project");
 assert.equal(await resume(elsewhere, project), 0, "and back");
 // The same for a bundled extension, which is decided while Pi loads.
 previous = await start(whimsical, { local: ["npm:mitsupi"] }, () => install(path.join(project, ".pi", "npm", "node_modules", "mitsupi"), "mitsupi"));
@@ -258,13 +273,13 @@ for (const [name, settings, setup] of [
 	assert.deepEqual(await skills(await withArgs(["--approve"], () => start(extendingPi, settings, setup))), [], `--approve, ${name}`);
 }
 // ...unless its filter loads none of that kind, or excludes the bundled entry.
-assert.equal((await skills(await withArgs(["--approve"], () => start(extendingPi, { local: [{ source: "npm:pi-extensions", skills: [] }] })))).length, 2);
+assert.equal((await skills(await withArgs(["--approve"], () => start(extendingPi, { local: [{ source: "npm:pi-extensions", skills: [] }] })))).length, 1);
 const missingMitsupi = (filter) => withArgs(["--approve"], () => start(whimsical, { local: [{ source: "npm:mitsupi", ...filter }] }));
 assert.ok((await missingMitsupi({ extensions: ["!extensions/whimsical.ts"] })).other > 0, "not installed, entry excluded");
 assert.equal((await missingMitsupi({ extensions: ["extensions/whimsical.ts"] })).other, 0, "not installed, entry included");
 
 // With --no-approve Pi won't load the project copy, so the bundled copy stays.
-assert.equal((await skills(await withArgs(["--no-approve"], () => start(extendingPi, projectCopy, projectInstall)), false)).length, 2, "--no-approve");
+assert.equal((await skills(await withArgs(["--no-approve"], () => start(extendingPi, projectCopy, projectInstall)), false)).length, 1, "--no-approve");
 
 // Extensions load before Pi decides trust, and otherwise trust isn't certain then: another
 // extension's project_trust handler can overrule a saved answer or defaultProjectTrust. So a
@@ -320,7 +335,7 @@ assert.match((await sessionStart(overruled, false, false))[0], /^stderr: .*--no-
 for (const run of [(f) => f(), headless]) {
 	for (const trusted of [false, true]) {
 		const discovered = await run(() => start(extendingPi, projectCopy, trustFile(true, projectInstall)));
-		assert.equal((await skills(discovered, trusted)).length, trusted ? 0 : 2, "follow the final trust decision");
+		assert.equal((await skills(discovered, trusted)).length, trusted ? 0 : 1, "follow the final trust decision");
 	}
 }
 
@@ -385,18 +400,18 @@ assert.deepEqual(await sessionStart(await reload(extendingPi), true), [], "resol
 // covered. The remaining bundled skills still load. No personal copy means no notice.
 for (const [filter, expectedSkills] of [
 	[undefined, 0],
-	[{ skills: ["extending-pi/SKILL.md"] }, 1],
+	[{ skills: ["skills/surf/SKILL.md"] }, 1],
 ]) {
 	const notices = [];
-	const registration = await start(extendingPi, { global: [{ source: "git:github.com/tmustier/pi-extensions", ...filter }] }, gitInstall());
+	const registration = await start(surfSkills, { global: [{ source: surfSource, ...filter }] }, surfInstall);
 	const files = await skills(registration, true, notices);
 	assert.equal(files.length, expectedSkills);
-	if (filter) assert.ok(files[0].endsWith("skill-creator/SKILL.md"));
+	if (filter) assert.ok(files[0].endsWith("deep-x-research/SKILL.md"));
 	assert.equal(notices.length, 1);
-	assert.match(notices[0], /Pi is using your own copies of 1 bundled package.*\n<dim>- pi-extensions<\/dim>/);
+	assert.match(notices[0], /Pi is using your own copies of 1 bundled package.*\n<dim>- surf-cli<\/dim>/);
 }
 const noCopyNotices = [];
-assert.equal((await skills(await start(extendingPi), true, noCopyNotices)).length, 2);
+assert.equal((await skills(await start(extendingPi), true, noCopyNotices)).length, 1);
 assert.deepEqual(noCopyNotices, []);
 
 // Pi's scope precedence and autoload:false deltas must still decide which files load.

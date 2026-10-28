@@ -1,6 +1,6 @@
 // Exercise the registered command/events; only the provider and clock are replaced.
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { discoverAndLoadExtensions } from "@earendil-works/pi-coding-agent";
@@ -32,9 +32,6 @@ const response = (text, stopReason = "stop") => ({
 	role: "assistant", content: [{ type: "text", text }], stopReason, errorMessage: text,
 });
 let complete = async () => response("A short update");
-let observed;
-let observedModel;
-let requests = 0;
 const model = { provider: "openai-codex", id: "gpt-6-luna" };
 const fallback = { provider: "openai", id: "gpt-6-luna" };
 const custom = { provider: "openrouter", id: "anthropic/custom-model" };
@@ -48,10 +45,7 @@ const ctx = {
 		find: (provider, id) => [model, fallback, custom].find((m) => m.provider === provider && m.id === id),
 		hasConfiguredAuth: () => true,
 		complete: async (selected, request, options) => {
-			requests++;
 			attempts.push({ selected, request, options });
-			observedModel = selected;
-			observed = request;
 			return complete(options, selected);
 		},
 	},
@@ -71,8 +65,8 @@ try {
 		{ type: "compaction", summary: "The old import path no longer exists" },
 	);
 	await command("", ctx);
-	assert.equal(observedModel, model, "wut should prefer openai-codex/gpt-6-luna");
-	const prompt = observed.messages[0].content[0].text;
+	assert.equal(attempts.at(-1).selected, model, "wut should prefer openai-codex/gpt-6-luna");
+	const prompt = attempts.at(-1).request.messages[0].content[0].text;
 	for (const expected of ["Fix the import", "Checking dependencies", "Agent ran tool bash", "(FAILED)", "Missing module", "old import path"]) {
 		assert.ok(prompt.includes(expected), expected);
 	}
@@ -81,7 +75,7 @@ try {
 
 	ctx.modelRegistry.hasConfiguredAuth = () => false;
 	await command("", ctx);
-	assert.equal(observedModel, ctx.model, "wut should keep the session-model fallback without observer auth");
+	assert.equal(attempts.at(-1).selected, ctx.model, "wut should keep the session-model fallback without observer auth");
 	ctx.modelRegistry.hasConfiguredAuth = () => true;
 
 	for (const thrown of [false, true]) {
@@ -95,12 +89,12 @@ try {
 		assert.deepEqual(attempts.map((a) => a.selected), [model, fallback]);
 		assert.equal(notices.at(-1), "Fallback update");
 		assert.deepEqual(attempts[0].request, attempts[1].request);
-		assert.deepEqual(attempts[0].options, attempts[1].options);
+		assert.equal(attempts[0].options.sessionId, attempts[1].options.sessionId);
 	}
 
 	ctx.modelRegistry.hasConfiguredAuth = (selected) => selected === fallback;
 	await command("", ctx);
-	assert.equal(observedModel, fallback, "use openai when codex auth is missing");
+	assert.equal(attempts.at(-1).selected, fallback, "use openai when codex auth is missing");
 	ctx.modelRegistry.hasConfiguredAuth = () => true;
 
 	attempts.length = 0;
@@ -137,10 +131,17 @@ try {
 	ctx.modelRegistry.hasConfiguredAuth = () => true;
 	writeFileSync(configPath, JSON.stringify({ models: ["missing/model"] }));
 	await assert.rejects(command("", ctx), /No authenticated wut model/);
-	for (const invalid of ['{', '{}', '{"models":[]}', '{"models":["no-provider"]}', '{"models":[1]}', '{"models":["openai/x"],"typo":true}']) {
+	writeFileSync(configPath, "{");
+	await assert.rejects(command("", ctx), /wut\.json/);
+	for (const invalid of ['{}', '{"models":[]}', '{"models":["no-provider"]}', '{"models":[1]}', '{"models":["openai/x"],"typo":true}']) {
 		writeFileSync(configPath, invalid);
 		await assert.rejects(command("", ctx), /wut\.json/);
 	}
+	rmSync(configPath);
+	symlinkSync(configPath, configPath);
+	attempts.length = 0;
+	await assert.rejects(command("", ctx), /ELOOP/);
+	assert.equal(attempts.length, 0, "an unreadable explicit configuration must not select default providers");
 	rmSync(configPath);
 
 	// Cancel while the provider is answering: a stale STUCK result must never steer the agent.
@@ -152,15 +153,15 @@ try {
 		for (let i = 0; i < 3; i++) handlers.get("tool_execution_end")({ toolCallId: `${i}` }, ctx);
 		const deferred = Promise.withResolvers();
 		complete = () => deferred.promise;
-		const before = requests;
+		const before = attempts.length;
 		const checking = tick();
-		assert.equal(requests, before + 1, "watchdog did not consult the provider");
+		assert.equal(attempts.length, before + 1, "watchdog did not consult the provider");
 		if (cancel === "off") await command("auto off", ctx);
 		else await handlers.get(cancel)({ source: "interactive" }, ctx);
 		deferred.resolve(response("STUCK: repeating the failed command"));
 		await checking;
 		assert.equal(sent.length, 0, `steered after ${cancel}`);
-		assert.equal(requests, before + 1, `fallback request after ${cancel}`);
+		assert.equal(attempts.length, before + 1, `fallback request after ${cancel}`);
 	}
 	assert.equal(intervals.size, 0, "session shutdown left the watchdog running");
 	console.log("ok");

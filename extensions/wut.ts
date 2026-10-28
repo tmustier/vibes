@@ -1,6 +1,7 @@
+import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { feature } from "../lib/feature.ts";
-import { readObserverConfig } from "../lib/wut-config.ts";
 /** /wut explains recent activity without interrupting the agent. /wut auto on|off toggles its watchdog. */
 
 import { uuidv7, type AssistantMessage, type Message } from "@earendil-works/pi-ai";
@@ -170,13 +171,37 @@ const makeUserMessage = (text: string): Message => ({
 });
 
 const observerModels = (ctx: ExtensionContext) => {
-	const config = readObserverConfig(join(getAgentDir(), "wut.json"));
-	const observers = config.models.flatMap((reference) => {
+	const path = join(getAgentDir(), "wut.json");
+	let text: string | undefined;
+	try {
+		text = readFileSync(path, "utf8");
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+	}
+	const configured = text !== undefined;
+	let references = ["openai-codex/gpt-6-luna", "openai/gpt-6-luna"];
+	if (text !== undefined) {
+		let config: unknown;
+		try {
+			config = JSON.parse(text);
+		} catch (error) {
+			throw new Error(`${path}: ${error instanceof Error ? error.message : error}`);
+		}
+		assert(config && typeof config === "object" && "models" in config && Object.keys(config).length === 1,
+			`${path}: expected an object containing only a models list`);
+		assert(Array.isArray(config.models) && config.models.length > 0, `${path}: models must be a nonempty list`);
+		references = config.models.map((reference: unknown) => {
+			assert(typeof reference === "string" && /^[^/\s]+\/\S+$/.test(reference), `${path}: expected provider/model-id`);
+			return reference;
+		});
+	}
+	const observers = [...new Set(references)].flatMap((reference) => {
 		const slash = reference.indexOf("/");
 		const model = ctx.modelRegistry.find(reference.slice(0, slash), reference.slice(slash + 1));
 		return model && ctx.modelRegistry.hasConfiguredAuth(model) ? [model] : [];
 	});
-	return observers.length ? observers : config.useSessionFallback && ctx.model ? [ctx.model] : [];
+	if (!configured && observers.length === 0 && ctx.model) observers.push(ctx.model);
+	return observers;
 };
 
 const askObserver = async (
@@ -185,8 +210,10 @@ const askObserver = async (
 	sessionId: string,
 	signal?: AbortSignal,
 ): Promise<AssistantMessage> => {
-	let failure: unknown = new Error("No authenticated wut model available; check /login and wut.json");
-	for (const model of observerModels(ctx)) {
+	const models = observerModels(ctx);
+	let model = models.shift();
+	assert(model, "No authenticated wut model available; check /login and wut.json");
+	for (;;) {
 		signal?.throwIfAborted();
 		try {
 			const response = await ctx.modelRegistry.complete(
@@ -199,13 +226,12 @@ const askObserver = async (
 			}
 			if (response.stopReason === "error") throw new Error(response.errorMessage || "error");
 			return response;
-		} catch (err) {
-			// Closing the overlay or cancelling a watchdog check must not start another request.
-			if (signal?.aborted || (err instanceof Error && err.name === "AbortError")) throw err;
-			failure = err;
+		} catch (error) {
+			const fallback = models.shift();
+			if (!fallback || signal?.aborted || (error instanceof Error && error.name === "AbortError")) throw error;
+			model = fallback;
 		}
 	}
-	throw failure;
 };
 
 export default feature(import.meta.url, (pi: ExtensionAPI) => {

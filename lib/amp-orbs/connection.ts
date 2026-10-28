@@ -143,10 +143,12 @@ export class ThreadConnection {
 		this.state.resetConnection(); this.changed();
 		this.handshake = setTimeout(() => fail("Amp actor synchronization timed out"), 30000);
 		// Report only our own errors: platform errors can quote URLs that carry tokens.
-		this.open(this.state.status.threadId, this.capability, this.controller.signal).then(({ socket, version }) => {
+		this.open(this.state.status.threadId, this.capability, this.controller.signal).then(({ socket }) => {
 			if (!current()) return socket.close();
 			this.socket = socket;
-			socket.addEventListener("open", () => socket.send(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "client_resume", params: { version } })));
+			// A new observer has no message cache. The authorization version skips stored replies,
+			// so resume from zero to hydrate the latest reply before evaluating the live state.
+			socket.addEventListener("open", () => socket.send(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "client_resume", params: { version: 0 } })));
 			socket.addEventListener("close", () => fail("Amp actor disconnected"));
 			socket.addEventListener("error", () => fail("Amp actor transport error"));
 			socket.addEventListener("message", (event) => {

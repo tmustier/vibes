@@ -4,7 +4,7 @@
   "license": "MIT",
   "description": "Personal Pi setup and starter bundle",
   "type": "module",
-  "piDependencyCutoff": "2026-10-22T09:40:34.996Z",
+  "piDependencyCutoff": "2026-10-28T17:49:32.744Z",
   "scripts": {
     "typecheck": "tsc --noEmit",
     "test:anthropic-gzip": "node --test packages/pi-anthropic-gzip/index.test.ts && node tests/test_anthropic_gzip.mjs",
@@ -13,8 +13,8 @@
   "dependencies": {
     "@earendil-works/pi-radius": "0.1.19",
     "@earendil-works/pi-voice": "0.2.0",
-    "@howaboua/pi-codex-conversion": "4.0.4",
-    "@howaboua/pi-codex-imagegen": "0.0.11",
+    "@howaboua/pi-codex-conversion": "4.0.5",
+    "@howaboua/pi-codex-imagegen": "0.0.12",
     "@tmustier/pi-anthropic-gzip": "file:packages/pi-anthropic-gzip",
     "@tmustier/pi-browser": "file:packages/pi-browser",
     "@tmustier/pi-queue-steer": "git+https://github.com/tmustier/pi-queue-steer.git#v0.2.2",
@@ -22,13 +22,13 @@
     "codex-computer-use-mcp": "latest",
     "mitsupi": "1.6.0",
     "pi-codex-goal": "0.6.1",
-    "pi-extensions": "0.1.67",
-    "pi-subagents": "0.80.0",
-    "pi-web-access": "0.44.0",
+    "pi-extensions": "0.1.74",
+    "pi-subagents": "0.83.1",
+    "pi-web-access": "0.45.0",
     "pi-you-should-know": "git+https://github.com/tmustier/pi-you-should-know.git#4ffceda99b625b633a1ea4fd0a253740947759da",
-    "pine-of-glass": "0.18.3",
+    "pine-of-glass": "0.18.4",
     "read-agent-instructions": "git+https://github.com/tmustier/read-agent-instructions.git",
-    "surf-cli": "2.22.0"
+    "surf-cli": "2.25.0"
   },
   "pi": {
     "extensions": [
