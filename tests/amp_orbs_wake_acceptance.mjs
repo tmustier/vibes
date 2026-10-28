@@ -245,6 +245,7 @@ Later, when an Amp orb update arrives, do not call any tools: reply UPDATE RECEI
 	record({ type: "phase4_passed" });
 
 	// Phase 5: the entire new task, including its input, occurs with the main observer closed.
+	// agent-default (not a user rule): 2026-10-28. The bounds below limit this scratch test, not remote work.
 	const offlineAt = Date.now();
 	const offlineWriter = new ThreadConnection(c); peers.add(offlineWriter);
 	let offlineRestoredAt;
