@@ -85,8 +85,8 @@ const first = `This is a live acceptance test of the Claude artifact tools in Pi
 5. Read the artifact's comments with ArtifactComments.
 6. Delete the artifact with the Artifact tool. Respect the user's answer and do not retry a delete the user declined.
 End with STEP ONE DONE and the artifact URL.`;
-const second = `Change "Revision two" to "Revision three" in your page file and publish it again to the same artifact, with the stylesheet, the same way as before. Do not pass force or overwrite_unread yourself. End with STEP TWO DONE.`;
-const large = `Using the Artifact tool's own edits parameter, change "Revision three" to "Revision four" in your page and publish it to the same artifact. Do not pass force or overwrite_unread yourself. End with STEP THREE DONE.`;
+const second = `This turn tests a stale publish. Change "Revision two" to "Revision three" in your existing local page file, then attempt to publish it to the same artifact with the stylesheet BEFORE calling Artifact read or list. If the publish refuses, use its response to merge any outside changes and retry. Do not pass force or overwrite_unread yourself. End with STEP TWO DONE.`;
+const large = `This turn tests a stale publish of a large page. Using the Artifact tool's own edits parameter, attempt to change "Revision three" to "Revision four" in the same artifact BEFORE calling Artifact read or list. If the publish refuses, follow its instructions to read and merge the live page, then retry. Do not pass force or overwrite_unread yourself. End with STEP THREE DONE.`;
 const third = "I've changed my mind: delete that artifact now. End with STEP FOUR DONE.";
 fs.writeFileSync(path.join(evidence, "prompts.txt"), [first, second, large, third].join("\n\n---\n\n"));
 
