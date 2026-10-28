@@ -32,6 +32,7 @@ Pi adds what `claude mcp serve` does not provide:
 
 - Claude Code asks before some publishes, such as the first publish that declares runtime capabilities or a change to a public artifact. `claude mcp serve` does not ask, so in Pi these publish straight away, as they do in Claude Code's auto and bypass modes. Deletes still need confirmation.
 - `claude mcp serve` cannot see claude.ai connectors, so it cannot check the connector tool names a page declares. It publishes with a warning that the connector was not observed. The `artifact-capabilities` skill explains how to check the names.
+- Tracking a large live page saved to disk requires Pi's native `read` tool. Shell reads from a tool adapter do not count towards viewing that version. Use a configuration that retains Pi's native file tools for this workflow; for pi-codex-conversion, its Voice only mode retains them.
 - Watches and comments sent to Claude do not wake a Pi session. Read comments with `ArtifactComments` when the user asks.
 - Publishing does not open the browser, unlike Claude Code's first publish in a session. Pi opens an artifact only for an `open` call.
 - Pi's update check and the publish are two requests, so a version saved in the moment between them can be overwritten. Claude Code makes the same check inside one call.
@@ -43,4 +44,5 @@ Pi adds what `claude mcp serve` does not provide:
 - `npx jiti tests/test_claude_artifacts.mjs`
 - `node tests/test_features.mjs` (through `npx jiti`)
 - `npm run typecheck`
+- The live test expects Pi's native file tools. If pi-codex-conversion replaces them, select Voice only mode through `/codex` in the test configuration first. Keep personal settings unchanged when using a scratch configuration.
 - Explicit live test (uses the Claude account and model quota): `npx jiti tests/claude_artifacts_acceptance.mjs /absolute/scratch/evidence-dir`. It runs `openai-codex/gpt-6.1-sol` with medium thinking, lets the model use the real tools to publish, redeploy the same file, update a multi-file page, read, write and read the shared database, read comments, merge after another writer's change (a small page and one over 50,000 characters) and attempt deletes, and checks each result through claude.ai independently. The test answers Pi's delete question Keep, then Delete, and then checks the artifact is gone. It deletes any scratch artifact it leaves.
