@@ -23,6 +23,9 @@ try {
 	fs.writeFileSync(configPath, JSON.stringify(config));
 	assert.match(cli(), /cachemire: on \(personal\)/);
 	assert.match(cli(), /amp-orbs: off \(default\)/);
+	assert.match(cli(), /claude-artifacts: on \(default\)/);
+	fs.writeFileSync(configPath, JSON.stringify({ features: { "claude-artifacts": false } }));
+	assert.match(cli(), /claude-artifacts: off \(personal\)/);
 	assert.match(cli(), /anthropic-gzip: on \(default\)/);
 	fs.writeFileSync(configPath, JSON.stringify({ features: { "anthropic-gzip": false } }));
 	assert.match(cli(), /anthropic-gzip: off \(personal\)/);

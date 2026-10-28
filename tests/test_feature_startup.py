@@ -3,6 +3,7 @@
 import json
 import os
 import select
+import shutil
 import subprocess
 import tempfile
 import time
@@ -48,6 +49,10 @@ with tempfile.TemporaryDirectory(prefix="vibes-feature-startup-") as scratch:
     settings.write_text(json.dumps({"packages": [str(ROOT)]}))
     default = commands(agent, project)
     assert "cache" not in default and "pace" not in default
+    assert ("skill:artifact-design" in default) == bool(shutil.which("claude")), "Claude artifact tools add nothing without Claude Code"
+    config.write_text(json.dumps({"features": {"claude-artifacts": False}}))
+    assert not {"skill:artifact-design", "skill:artifact-capabilities"} & commands(agent, project), "the feature opt-out also removes its skills"
+    config.unlink()
     assert {"skill:surf", "open", "ysk"} <= default
     settings.write_text(json.dumps({"packages": [str(ROOT), str(ROOT / "node_modules/pi-you-should-know")]}))
     assert "ysk" in commands(agent, project), "a separately installed copy must not register /ysk twice"

@@ -5,6 +5,7 @@ export const featureDefaults = {
 	// agent-default (not a user rule): 2026-10-16. Compress eligible Anthropic uploads.
 	"anthropic-gzip": true,
 	browser: true,
+	"claude-artifacts": true,
 	"code-actions": true,
 	"computer-use": true,
 	contextimate: true,
