@@ -54,6 +54,36 @@ test("completed work never wakes again through repeated disconnect and reconnect
 	restored.disconnect("Amp actor disconnected"); assert.equal(restored.markSeen(), false);
 });
 
+test("cold idle restores distinguish new user work from retries and history replay", () => {
+	const user = (messageId) => ({ type: "message_added", message: { role: "user", messageId, content: [{ type: "text", text: "Task" }] } });
+	const reply = (messageId) => ({ type: "message_added", message: { role: "assistant", messageId, content: [{ type: "text", text: "Same answer" }] } });
+	const idle = (messageId) => ({ type: "agent_state", state: "idle", messageId });
+	const first = [user("input-A"), reply("answer-A"), idle("answer-A")];
+	const next = [user("input-A"), reply("answer-A"), user("input-B"), reply("answer-B"), idle("answer-B")];
+	for (const reconnect of [false, true]) {
+		const original = new ThreadState(id, "https://ampcode.com");
+		original.apply(ack); original.apply(first); assert(original.markSeen());
+		const restored = reconnect ? original : new ThreadState(id, "https://ampcode.com", original.checkpoint());
+		if (reconnect) restored.resetConnection();
+		restored.apply(ack); restored.apply(next);
+		assert(restored.markSeen(), "work started and completed entirely offline still reports");
+		assert.equal(restored.markSeen(), false);
+		assert.equal(restored.checkpoint().userMessageId, "input-B");
+		const replayed = new ThreadState(id, "https://ampcode.com", restored.checkpoint());
+		// Older user messages in full replay must not advance the current task.
+		replayed.apply(next); replayed.apply(ack); assert.equal(replayed.markSeen(), false);
+		replayed.resetConnection(); replayed.apply(ack);
+		replayed.apply([...next.slice(0, -1), reply("retry-with-new-id"), idle("retry-with-new-id")]);
+		assert.equal(replayed.markSeen(), false, "same-input retries with new assistant IDs stay deduplicated");
+		// A live input invalidates the old idle result before the new assistant starts.
+		replayed.apply([user("input-C")]);
+		assert.equal(replayed.status.settled, false);
+		assert.equal(replayed.markSeen(), false, "queued work does not report the previous answer");
+		replayed.apply([reply("answer-C"), idle("answer-C")]);
+		assert(replayed.markSeen()); assert.equal(replayed.markSeen(), false);
+	}
+});
+
 test("legacy reported outcomes stay seen after the checkpoint format changes", () => {
 	for (const failure of [false, true]) {
 		const response = "Already reported";
@@ -145,7 +175,7 @@ test("a failed assistant attempt that Amp retries does not wake; one left failed
 	assert.equal(left.status.error, "Amp assistant message failed"); assert(left.markSeen(), "a failure left at idle wakes");
 	assert.equal(left.markSeen(), false, "and only once");
 
-	// Papercut #1403: Amp resumed the orb after a reported failure and its reply succeeded.
+	// An orb can resume after a reported failure and later reply successfully.
 	left.apply(event("agent_state", { state: "running_tools", messageId: "m3" })); left.apply(delta("m4", "complete"));
 	left.apply(event("agent_state", { state: "idle", messageId: "m4" }));
 	assert.equal(left.status.error, undefined, "a later successful reply is completion, not the old failure");
@@ -195,7 +225,7 @@ test("notification: new errors and approvals are independent of existing or rear
 	}
 });
 
-// Replays the frame shape behind the 21 October rate-limit storm: Amp retried failed reply attempts
+// Replays failed reply attempts retried by Amp
 // under new message IDs while streaming, then stopped in its own "error" state.
 test("retried attempts never wake; Amp's error state settles and wakes once per episode", () => {
 	const delta = (messageId, state) => event("delta", { role: "assistant", messageId, blocks: [{ type: "text", text: "x" }], contentMode: "snapshot", state });

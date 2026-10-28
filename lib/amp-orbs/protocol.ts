@@ -15,7 +15,7 @@ export const archivedError = "Amp thread is archived";
 export const persistentFailures = 6;
 // Server-side and network failures that usually clear on their own, so they wake Pi only once persistent.
 const transientError = /^Amp actor (connection failed|authorization failed \(HTTP (429|5\d\d)\))$/;
-export type Checkpoint = { pendingAfter?: string; ignoredQuestions?: string[]; notificationKeys?: string[]; episode?: number };
+export type Checkpoint = { pendingAfter?: string; ignoredQuestions?: string[]; notificationKeys?: string[]; episode?: number; userMessageId?: string };
 
 function notificationKey(identity: unknown): string {
 	const canonical = JSON.stringify(identity, (_key, value) => value && typeof value === "object" && !Array.isArray(value)
@@ -40,6 +40,9 @@ export class ThreadState {
 	// stay in the same episode; it advances only when Pi sends, or when the orb starts new work
 	// after an outcome was reported.
 	private episode: number;
+	// Persist the input boundary, not assistant IDs, which also change during retries.
+	private userMessageId?: string;
+	private replayedUserMessageId?: string;
 	private runtimeError?: string;
 	// Set by a send: until a new message appears, the old idle state and these questions are stale.
 	private pendingAfter?: string;
@@ -54,13 +57,15 @@ export class ThreadState {
 		this.ignoredQuestions = checkpoint.ignoredQuestions ?? [];
 		this.notified = new Set(checkpoint.notificationKeys);
 		this.episode = checkpoint.episode ?? 0;
+		this.userMessageId = checkpoint.userMessageId;
 		this.status = { threadId, url: `${origin}/threads/${threadId}`, connection: "connecting", archived: false, state: "unknown", settled: false, features: [], questions: [], approvals: [], response: "" };
 	}
 	checkpoint(): Checkpoint {
-		return { pendingAfter: this.pendingAfter, ignoredQuestions: this.ignoredQuestions, notificationKeys: [...this.notified], episode: this.episode };
+		return { pendingAfter: this.pendingAfter, ignoredQuestions: this.ignoredQuestions, notificationKeys: [...this.notified], episode: this.episode, userMessageId: this.userMessageId };
 	}
 	resetConnection() {
 		this.acknowledged = this.snapshot = false;
+		this.replayedUserMessageId = undefined;
 		this.failedAttempt = false; this.runtimeError = undefined;
 		this.status = { ...this.status, connection: "connecting", archived: false, state: "unknown", questions: [], approvals: [], error: undefined };
 		this.update();
@@ -113,6 +118,16 @@ export class ThreadState {
 				if (this.reported()) this.episode++;
 			}
 		}
+		if (type === "message_added" && p.message.role === "user") {
+			this.replayedUserMessageId = p.message.messageId;
+			if (s.connection === "connected" && p.message.messageId !== this.userMessageId) {
+				// A live appended input cannot settle on the previous reply while queued.
+				this.pendingAfter ??= s.messageId ?? "";
+				this.ignoredQuestions = s.questions.map((q) => q.requestId);
+				this.started = false; this.failedAttempt = false; this.runtimeError = undefined;
+				s.state = "unknown";
+			}
+		}
 		if (type === "thread_features") s.features = p.features;
 		if (type === "tool_approval_queue") s.approvals = p.approvals;
 		if (type === "error" || type === "executor_error") {
@@ -146,6 +161,12 @@ export class ThreadState {
 	private effectiveQuestions() { return this.status.questions.filter((q) => !this.ignoredQuestions.includes(q.requestId)); }
 	private update() {
 		const s = this.status;
+		// Compare only after the complete snapshot/ack gate: older inputs in full-history
+		// replay are not new tasks. A different latest input recovers work completed offline.
+		if (s.connection === "connected" && this.replayedUserMessageId !== undefined) {
+			if (this.userMessageId !== undefined && this.userMessageId !== this.replayedUserMessageId && this.reported()) this.episode++;
+			this.userMessageId = this.replayedUserMessageId;
+		}
 		// A failed attempt is a failure only once the orb stops; Amp's own "error" state is always one.
 		const stopped = s.state === "error" || (this.failedAttempt && s.state === "idle");
 		s.error = this.runtimeError ?? (stopped ? (this.failedAttempt ? "Amp assistant message failed" : "Amp orb stopped with an error") : undefined);

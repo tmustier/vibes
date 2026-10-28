@@ -99,15 +99,15 @@ export default function ampOrbs(pi: ExtensionAPI, { launch = launchOrb, open = o
 	const track = (id: string, checkpoint?: Checkpoint) => {
 		const thread = new ThreadConnection(id, checkpoint, open);
 		threads.set(id, thread);
-		let episode = thread.state.checkpoint().episode;
+		let observedCheckpoint = thread.state.checkpoint();
 		thread.subscribe(() => {
 			if (threads.get(id) !== thread) return;
 			// An archived thread is finished: stop watching it quietly. A later status read or message re-checks it.
 			if (thread.state.status.archived) { untrack(id); return; }
 			// Persist observed new work before its outcome: a reload must not restore the previous
 			// episode's completed identity and silently discard this episode's eventual result.
-			const nextEpisode = thread.state.checkpoint().episode;
-			if (nextEpisode !== episode) { episode = nextEpisode; save(); }
+			const next = thread.state.checkpoint();
+			if (next.episode !== observedCheckpoint.episode || next.userMessageId !== observedCheckpoint.userMessageId) { observedCheckpoint = next; save(); }
 			observe(id, thread);
 			updateStatus();
 		});

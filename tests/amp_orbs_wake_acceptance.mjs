@@ -1,6 +1,6 @@
 // Explicit live test: npx jiti tests/amp_orbs_wake_acceptance.mjs /absolute/evidence/directory
 // Uses the authenticated local Pi/Amp accounts and launches three scratch medium-mode orbs, archived at the
-// end. Never run as part of unit tests. It replays the two halves of the 21 October storm:
+// end. Never run as part of unit tests. It exercises busy-parent and model-outage notification cases:
 // 1. Orbs finish while Pi is busy: Pi gets one combined update when it becomes idle, not one turn each.
 // 2. Pi's own model is rate limited: orb updates hold instead of each starting a doomed turn.
 // Phase 2 points the real Pi session at a local endpoint that always answers HTTP 429, so Pi's real
@@ -135,7 +135,7 @@ Later, when an Amp orb update arrives, do not call any tools: reply UPDATE RECEI
 	const legacyKey = createHash("sha256").update(JSON.stringify(["idle", seenA.messageId, seenA.messageId, seenA.response])).digest("hex");
 	const checkpoint = structuredClone(session.sessionManager.getBranch().findLast((entry) => entry.type === "custom" && entry.customType === "amp-orbs-tracking").data);
 	const legacyA = checkpoint.find((item) => item.threadId === a);
-	delete legacyA.episode; legacyA.notificationKeys = [legacyKey];
+	delete legacyA.episode; delete legacyA.userMessageId; legacyA.notificationKeys = [legacyKey];
 	session.sessionManager.appendCustomEntry("amp-orbs-tracking", checkpoint);
 	const beforeUpgrade = count("orb_update");
 	await session.reload(); await sleep(25_000); await session.waitForIdle();
@@ -243,6 +243,31 @@ Later, when an Amp orb update arrives, do not call any tools: reply UPDATE RECEI
 	assert.equal(count("orb_update", workAt), beforeNewWork + 1, "a second reload does not repeat the delivered result");
 	assert(events.filter((e) => e.type === "assistant" && e.provider !== "ratelimited-stub").every((e) => e.provider === "openai-codex" && e.model === "gpt-6.1-sol"), "reload preserved the approved model for every real call");
 	record({ type: "phase4_passed" });
+
+	// Phase 5: the entire new task, including its input, occurs with the main observer closed.
+	const offlineAt = Date.now();
+	const offlineWriter = new ThreadConnection(c); peers.add(offlineWriter);
+	let offlineRestoredAt;
+	const savedC = () => session.sessionManager.getBranch().findLast((entry) => entry.type === "custom" && entry.customType === "amp-orbs-tracking").data.find((item) => item.threadId === c);
+	await session.reload({ beforeSessionStart: async () => {
+		const before = structuredClone(savedC());
+		assert(before.userMessageId, "the observed task input was checkpointed");
+		await offlineWriter.send("Reply exactly OFFLINE-C. Do not change any files.", { sessionId: `${session.sessionManager.getSessionId()}:outside`, opening: false });
+		const done = await waitFor([offlineWriter], () => offlineWriter.state.status.state === "idle" && offlineWriter.state.status.response.includes("OFFLINE-C"), undefined, 90_000);
+		assert(done, "the new task started and completed while the main observer was closed");
+		assert.deepEqual(savedC(), before, "no working transition or input was observed/checkpointed by the closed observer");
+		offlineWriter.stop(); peers.delete(offlineWriter);
+		offlineRestoredAt = Date.now();
+	} });
+	const offlineDeadline = Date.now() + 120_000;
+	while (Date.now() < offlineDeadline && !events.some((e) => e.type === "assistant" && e.at >= offlineAt && e.text.includes("OFFLINE-C"))) await sleep(500);
+	await session.waitForIdle();
+	assert.equal(events.find((e) => e.type === "orb_state" && e.threadId === c && e.at >= offlineRestoredAt)?.state, "idle");
+	assert.equal(count("orb_update", offlineAt), 1, "new offline input wakes the parent exactly once");
+	assert(events.some((e) => e.type === "assistant" && e.at >= offlineAt && e.text.includes("OFFLINE-C")), "the real model received the task completed wholly offline");
+	await session.reload(); await sleep(25_000); await session.waitForIdle();
+	assert.equal(count("orb_update", offlineAt), 1, "full history does not repeat the offline completion");
+	record({ type: "phase5_passed" });
 } catch (error) { failure = error; record({ type: "failure", message: error.message }); }
 finally {
 	for (const peer of peers) peer.stop();
