@@ -191,7 +191,14 @@ test("notification: approval identities ignore queue ordering and partial settle
 const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "amp-orbs-"));
 const authorizations = [];
 const replies = [];
-const server = http.createServer((request, response) => {
+const creations = [];
+const created = [];
+const server = http.createServer(async (request, response) => {
+	if (request.url === "/api/internal?createRemoteExecutorThread") {
+		let body = ""; for await (const chunk of request) body += chunk;
+		creations.push({ authorization: request.headers.authorization, ...JSON.parse(body) });
+		return response.end(JSON.stringify(created.shift()));
+	}
 	if (request.method === "POST") {
 		authorizations.push(request.headers.authorization);
 		const [status, body = "private detail"] = [replies.shift()].flat();
@@ -212,10 +219,15 @@ const args = process.argv.slice(2);
 if (args[0] === "usage") {
 	fs.appendFileSync(${JSON.stringify(path.join(scratch, "refreshes"))}, "usage\\n");
 	fs.writeFileSync(${JSON.stringify(path.join(scratch, "amp/accounts/secrets.json"))}, JSON.stringify({ ${JSON.stringify(sessionKey)}: "fresh" }));
-} else {
-	fs.readFileSync(0); // Hangs unless the caller closes stdin, as real amp -x does.
-	fs.writeFileSync(${JSON.stringify(path.join(scratch, "launch-args"))}, JSON.stringify(args));
-	console.log("Thread: https://ampcode.com/threads/${id}");
+} else if (args[0] === "projects") {
+	fs.readFileSync(0); // Hangs unless the caller closes stdin, as real amp does.
+	if (args[1] === "get") {
+		if (args[2] !== "org/repo") { console.error("Error: No accessible Amp project matches"); process.exit(1); }
+		console.log(JSON.stringify({ id: "project-named", name: "repo" }));
+	} else {
+		const status = fs.readFileSync(${JSON.stringify(path.join(scratch, "project-status"))}, "utf8");
+		console.log(JSON.stringify(status === "matched" ? { status, project: { id: "project-inferred" } } : { status, project: null }));
+	}
 }
 `);
 fs.chmodSync(path.join(scratch, "bin/amp"), 0o755);
@@ -249,12 +261,28 @@ test("only Amp's THREAD_ARCHIVED code marks a thread archived", async () => {
 	authorizations.splice(0);
 });
 
-test("launch passes the literal prompt and options, closes stdin, and returns the canonical thread ID", async () => {
-	const prompt = "literal $(touch should-not-exist)\nno rephrasing";
-	assert.equal(await launch({ prompt, cwd: scratch, mode: "external-agent:claude-code", project: "org/repo", features: ["model:claude-opus-5-5", "effort:high"] }), id);
-	const args = JSON.parse(fs.readFileSync(path.join(scratch, "launch-args")));
-	assert.equal(args[args.indexOf("-ox") + 1], prompt);
-	assert.equal(args[args.indexOf("--features") + 1], "model:claude-opus-5-5,effort:high");
-	assert.equal(args[args.indexOf("--project") + 1], "org/repo");
-	assert(!fs.existsSync(path.join(scratch, "should-not-exist")));
+test("launch creates the orb as amp -ox does, opening with a hidden placeholder for Pi's labelled task", async () => {
+	const sessionId = "01a182cf-a771-70ae-a278-bf133e8dca4e";
+	const options = { cwd: scratch, mode: "external-agent:claude-code", title: "Task", features: ["model:claude-opus-5-5", "effort:high"], sessionId };
+	created.push({ ok: true, result: { threadID: id } });
+	assert.equal(await launch({ ...options, project: "org/repo" }), id);
+	const [{ authorization, method, params: { content: [placeholder, ...rest], userState: _, ...params } }] = creations.splice(0);
+	assert.equal(authorization, "Bearer personal", "the active CLI account creates the orb");
+	assert.equal(method, "createRemoteExecutorThread");
+	assert.deepEqual(params, {
+		agentMode: "external-agent:claude-code", features: ["model:claude-opus-5-5", "effort:high"], projectID: "project-named",
+		executeMode: true, title: "Task", threadMeta: { visibility: "thread_workspace_shared" },
+	});
+	assert.deepEqual(rest, [], "the prompt is not part of the launch");
+	assert(placeholder.hidden && placeholder.text.includes(sessionId), "the thread opens with a hidden placeholder naming the Pi session");
+	for (const [status, projectID] of [["matched", "project-inferred"], ["unmatched", null]]) {
+		fs.writeFileSync(path.join(scratch, "project-status"), status); created.push({ ok: true, result: { threadID: id } });
+		await launch(options);
+		assert.equal(creations.splice(0)[0].params.projectID, projectID, "without a project, cwd's Git remotes choose it");
+	}
+	await assert.rejects(launch({ ...options, project: "missing/repo" }), /No accessible Amp project matches missing\/repo/);
+	assert.equal(creations.length, 0, "an unknown project creates nothing");
+	created.push({ ok: false, error: { code: "invalid-params", message: "Unknown agent mode" } });
+	await assert.rejects(launch(options), /Amp refused to create the orb: Unknown agent mode/);
+	authorizations.splice(0);
 });

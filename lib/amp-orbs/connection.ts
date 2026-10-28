@@ -1,3 +1,4 @@
+import assert from "node:assert/strict";
 import { execFile, type ExecFileOptions } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
@@ -32,17 +33,21 @@ async function apiKey(origin: string): Promise<string> {
 	throw new Error("Amp CLI credential unavailable; run amp login (or set AMP_API_KEY)");
 }
 
+/** POST JSON to Amp with the CLI credential, refreshing it once through the CLI on 401. */
+async function post(origin: string, path: string, body: unknown, signal: AbortSignal): Promise<Response> {
+	const request = async () => fetch(`${origin}${path}`, { method: "POST", signal, headers: { Authorization: `Bearer ${await apiKey(origin)}`, "Content-Type": "application/json" }, body: JSON.stringify(body) });
+	const response = await request();
+	if (response.status !== 401 || process.env.AMP_API_KEY) return response;
+	// Let the CLI own OAuth refresh and its account store. Never copy refresh tokens.
+	await amp(["usage"], { signal, timeout: 30000 }).catch(() => { throw new Error("Amp credential refresh failed; run amp login"); });
+	return request();
+}
+
 type Socket = Pick<WebSocket, "send" | "close" | "addEventListener">;
 type OpenActor = (threadId: string, capability: "read" | "write", signal: AbortSignal) => Promise<{ socket: Socket; version: number }>;
 export const openActor: OpenActor = async (threadId, capability, signal) => {
 	const origin = ampOrigin();
-	const authorize = async () => fetch(`${origin}/api/thread-actors`, { method: "POST", signal, headers: { Authorization: `Bearer ${await apiKey(origin)}`, "Content-Type": "application/json" }, body: JSON.stringify({ threadId, capability }) });
-	let response = await authorize();
-	if (response.status === 401 && !process.env.AMP_API_KEY) {
-		// Let the CLI own OAuth refresh and its account store. Never copy refresh tokens.
-		await amp(["usage"], { signal, timeout: 30000 }).catch(() => { throw new Error("Amp credential refresh failed; run amp login"); });
-		response = await authorize();
-	}
+	const response = await post(origin, "/api/thread-actors", { threadId, capability }, signal);
 	if (!response.ok) {
 		// Read only Amp's machine-readable code; other error bodies may carry private detail.
 		const code = response.status === 409 ? await response.json().then((body) => body?.code, () => undefined) : undefined;
@@ -156,14 +161,23 @@ export class ThreadConnection {
 		await waitFor([this], () => this.state.status.connection !== "connecting", signal);
 		if (this.state.status.connection !== "connected") throw new Error(this.state.status.connectionError);
 	}
-	async send(text: string, signal?: AbortSignal) {
+	/**
+	 * Append text as a message from a Pi session, as Amp threads message each other: Amp's app labels it as
+	 * an agent's, and a hidden note, modelled on Amp's own, tells the orb who sent it.
+	 */
+	async send(text: string, { sessionId, opening }: PiSender, signal?: AbortSignal) {
 		if (this.capability === "read") { this.capability = "write"; this.start(); }
 		await this.ready(signal);
 		this.state.assertCanSend();
 		const id = ++this.requestId;
 		const messageId = `M-${randomUUID().replaceAll("-", "").slice(0, 22)}`;
 		this.state.rearm();
-		this.socket!.send(JSON.stringify({ jsonrpc: "2.0", id, method: "client_append_user_msg", params: { content: [{ type: "text", text }], agentMode: this.state.status.agentMode, messageId, steer: true } }));
+		const note = `\n\nThread message metadata: this message was sent by Pi session \`${sessionId}\`, an agent on the user's computer, not directly by the user.${opening ? "" : " Start acting on it without first replying to it in text."} Unless you delegated the work to it, do not add its changes to your work without the user's approval. Pi watches this thread and reads your final response, so include the outcome and anything Pi must decide or act on there.`;
+		// Amp shows the label as "Message from Pi <id> plugin". agent-default (not a user rule): 2026-10-28. The last
+		// 8 characters of the session ID tell sessions apart; its start is a timestamp that sessions share.
+		const meta = { generatedByPlugin: `Pi ${sessionId.slice(-8)}` };
+		const content = [{ type: "text", text }, { type: "text", text: note, hidden: true }];
+		this.socket!.send(JSON.stringify({ jsonrpc: "2.0", id, method: "client_append_user_msg", params: { content, meta, agentMode: this.state.status.agentMode, messageId, steer: true } }));
 		const accepted = await new Promise<boolean>((resolve, reject) => {
 			this.pending.set(id, { resolve, reject });
 			const deadline = AbortSignal.any([AbortSignal.timeout(30000), ...(signal ? [signal] : [])]);
@@ -179,16 +193,31 @@ export class ThreadConnection {
 	}
 }
 
-type LaunchOptions = { prompt: string; cwd: string; mode: string; title?: string; project?: string; features?: string[] };
-export async function launch({ prompt, cwd, mode, title, project, features }: LaunchOptions, signal?: AbortSignal): Promise<string> {
-	const args = ["-ox", prompt, "-m", mode, "--no-color", "--no-archive-after-execute"];
-	if (title) args.push("--title", title);
-	if (project) args.push("--project", project);
-	if (features?.length) args.push("--features", features.join(","));
-	const stdout = await amp(args, { cwd, signal, timeout: 120000 }).catch(() => {
-		throw new Error("Amp orb launch failed or was cancelled; check amp threads list before retrying (a remote thread may already exist)");
-	});
-	const id = stdout.match(/\bT-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/i)?.[0];
-	if (!id) throw new Error("Amp launch returned no canonical thread ID; check amp threads list before retrying");
-	return id;
+export type PiSender = { sessionId: string; opening: boolean };
+type LaunchOptions = { cwd: string; mode: string; title?: string; project?: string; features?: string[]; sessionId: string };
+/**
+ * Create an orb as `amp -ox` does, in the named project or else the one matching cwd's Git remotes. Amp cannot
+ * label a thread's first message, so the thread opens with a hidden placeholder and the caller sends the task next.
+ */
+export async function launch({ cwd, mode, title, project, features = [], sessionId }: LaunchOptions, signal?: AbortSignal): Promise<string> {
+	const projects = (args: string[]) => amp(["projects", ...args, "--json"], { cwd, signal, timeout: 30000 }).then(JSON.parse);
+	const projectID: string | null = project
+		? (await projects(["get", project]).catch(() => { throw new Error(`No accessible Amp project matches ${project}`); })).id
+		: await projects(["status"]).then((found) => {
+			assert(["matched", "unmatched"].includes(found.status), "Several Amp projects match this directory's Git remotes; pass project");
+			return found.project?.id ?? null;
+		});
+	const params = {
+		agentMode: mode, features, projectID, executeMode: true, title,
+		content: [{ type: "text", text: `Pi session \`${sessionId}\` is starting this thread. Its first message follows immediately; do not reply to this one.`, hidden: true }],
+		userState: { currentlyVisibleFiles: [], timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone },
+		threadMeta: { visibility: "thread_workspace_shared" },
+	};
+	// agent-default (not a user rule): 2026-10-28. The 2 minute limit the CLI launch had.
+	const deadline = AbortSignal.any([AbortSignal.timeout(120000), ...(signal ? [signal] : [])]);
+	const response = await post(ampOrigin(), "/api/internal?createRemoteExecutorThread", { method: "createRemoteExecutorThread", params }, deadline)
+		.then((r) => r.json())
+		.catch(() => { throw new Error("Amp orb launch failed or was cancelled; check amp threads list before retrying (a remote thread may already exist)"); });
+	if (!response.ok) throw new Error(`Amp refused to create the orb: ${response.error.message}`);
+	return response.result.threadID;
 }

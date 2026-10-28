@@ -63,7 +63,7 @@ session.subscribe((event) => {
 	if (event.type === "message_end" && event.message.role === "custom" && event.message.customType === "amp-orb-update") record({ type: "orb_update", content: event.message.content, details: event.message.details });
 	if (event.type === "message_end" && event.message.role === "assistant") record({ type: "assistant", content: event.message.content, provider: event.message.provider, model: event.message.model, thinking: event.message.thinkingLevel });
 });
-const prompt = `This is a live acceptance test of the four Amp tools already loaded. Do not use subagents or local Amp model calls. Use create_thread exactly once to launch a scratch low-mode orb, cwd ${cwd}, title Pi Amp tools acceptance. Literal orb prompt: "This is an isolated protocol acceptance test. Do not modify repositories or other threads. First use Bash to sleep 25 seconds. Then use ask_user_choice to ask Choose Red or Blue, with options Red and Blue. Wait for the answer, then reply exactly RECEIVED Blue if Blue is answered. Do not archive yourself." After create_thread returns, end your initial turn immediately with LAUNCHED and the thread ID. Do not wait or poll in that initial turn. The background observer should wake you. When its question update arrives, call get_thread_status, verify the pending question, call send_thread_message with Blue, then wait_for_threads (timeout_seconds 120), and get_thread_status to confirm RECEIVED Blue and idle. End with ACCEPTANCE PASSED only once confirmed. If a later duplicate update arrives after success, just acknowledge; do not create or send again. Do not change any personal settings or call any other delegation tool.`;
+const prompt = `This is a live acceptance test of the four Amp tools already loaded. Do not use subagents or local Amp model calls. Use create_thread exactly once to launch a scratch medium-mode orb, cwd ${cwd}, title Pi Amp tools acceptance. Literal orb prompt: "This is an isolated protocol acceptance test. Do not modify repositories or other threads. First use Bash to sleep 25 seconds. Then use ask_user_choice to ask Choose Red or Blue, with options Red and Blue. Wait for the answer, then reply exactly RECEIVED Blue if Blue is answered. Do not archive yourself." After create_thread returns, end your initial turn immediately with LAUNCHED and the thread ID. Do not wait or poll in that initial turn. The background observer should wake you. When its question update arrives, call get_thread_status, verify the pending question, call send_thread_message with Blue, then wait_for_threads (timeout_seconds 120), and get_thread_status to confirm RECEIVED Blue and idle. End with ACCEPTANCE PASSED only once confirmed. If a later duplicate update arrives after success, just acknowledge; do not create or send again. Do not change any personal settings or call any other delegation tool.`;
 fs.writeFileSync(path.join(evidence, "prompt.txt"), prompt);
 let failure;
 try {
@@ -101,7 +101,17 @@ try {
 		const thread = JSON.parse(raw);
 		assert.equal(thread.meta.lastKnownAgentState.state, "idle");
 		assert(thread.messages.some((m) => m.role === "assistant" && m.content.some((b) => b.type === "text" && b.text.includes("RECEIVED Blue"))));
-		record({ type: "independent_amp_export", threadId: id, state: thread.meta.lastKnownAgentState.state, verifiedReply: "RECEIVED Blue" });
+		const sessionId = session.sessionManager.getSessionId();
+		const [placeholder, task, blue] = thread.messages.filter((m) => m.role === "user" && m.content.some((b) => b.type === "text"));
+		assert(placeholder.content.every((b) => b.hidden) && placeholder.content[0].text.includes(sessionId), "The thread opens with Pi's hidden placeholder");
+		for (const [message, visible, followUp] of [[task, "This is an isolated protocol acceptance test", false], [blue, "Blue", true]]) {
+			const [shown, note] = message.content;
+			assert(shown.text.trim().startsWith(visible), `Pi's messages arrive in order: ${visible}`);
+			assert.equal(message.meta.generatedByPlugin, `Pi ${sessionId.slice(-8)}`, `"${visible}" is labelled as from this Pi session`);
+			assert(note.hidden && note.text.includes(`Pi session \`${sessionId}\``), `"${visible}" tells the orb which Pi session sent it`);
+			assert.equal(note.text.includes("Start acting"), followUp);
+		}
+		record({ type: "independent_amp_export", threadId: id, state: thread.meta.lastKnownAgentState.state, verifiedReply: "RECEIVED Blue", labelledFrom: `Pi ${sessionId.slice(-8)}` });
 		await session.prompt(`The scratch thread ${id} is independently verified complete. Call stop_tracking_thread for that exact ID, then reply DETACHED. Do not archive or cancel remote work.`);
 		await session.waitForIdle();
 		assert(events.some((e) => e.type === "tool_execution_start" && e.name === "stop_tracking_thread" && e.args.threadId === id), "Model did not call the actual unwatch tool");

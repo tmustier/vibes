@@ -4,11 +4,13 @@ Enable `"amp-orbs": true` in the `features` map in `~/.pi/agent/vibes.json`, the
 
 | Tool | Input | Behavior |
 |---|---|---|
-| `create_thread` | `prompt`, absolute local `cwd`, `mode`; optional `project`, `title`, `features[]` | Launches `amp -ox` with the literal prompt; returns canonical ID/URL immediately. `project` selects the Amp project/repository; otherwise Amp infers it from cwd's remotes. |
+| `create_thread` | `prompt`, absolute local `cwd`, `mode`; optional `project`, `title`, `features[]` | Creates the orb as `amp -ox` does, then sends the literal prompt as its first message from this Pi session; returns canonical ID/URL immediately. `project` selects the Amp project/repository; otherwise Amp infers it from cwd's remotes. |
 | `get_thread_status` | `threadId` | Synchronizes the direct observer; returns state, latest response, pending questions, approvals, errors and applied mode/features. Tracks existing IDs in this Pi session too. |
-| `send_thread_message` | `threadId`, `message` | Direct authenticated steering/reply; acknowledgement is acceptance, not completion. |
+| `send_thread_message` | `threadId`, `message` | Direct authenticated steering/reply from this Pi session; acknowledgement is acceptance, not completion. |
 | `wait_for_threads` | `threads` (1–10 IDs), optional `timeout_seconds` (default 300, max 600) | Awaits live events until **all** settle, or returns current states on timeout. No polling interval. |
 | `stop_tracking_thread` | `threadId` | Stops the local observer and saves that choice across reload. Does not cancel, archive or change the remote thread. A later status read or message resumes tracking. |
+
+Pi's messages reach the orb as agent messages, not as the user's, the way Amp threads message each other. Amp's app shows each one as "Message from Pi <last 8 characters of the session ID> plugin", expandable to the text. A hidden note that the orb reads but the app does not show names the full Pi session ID, says the message is not directly from the user, and asks for the outcome in the orb's final response, which Pi reads. The wording follows Amp's own note for messages between threads.
 
 Modes follow the account's Amp dial. For Claude Code, use `mode: "external-agent:claude-code"` and, for example, `features: ["model:claude-opus-5-5", "effort:high"]`. Those spellings were verified against Amp on 13 October 2026. Unknown feature/model strings can be silently ignored by Amp: compare returned features and the actual model in `amp threads export <id>`; this extension does not assert model selection from requested strings.
 
@@ -19,6 +21,8 @@ Cancellation releases a local wait/launch operation, not remote work. A cancelle
 ## Protocol boundary
 
 This is an opt-in integration with Amp's **currently observed, undocumented** actor protocol, not exact native-tool schema parity. `lib/amp-orbs/connection.ts` holds the transport boundary and `lib/amp-orbs/protocol.ts` the event protocol. The connection reads the active CLI account (server + user + login session), or `AMP_API_KEY`, and requests normal read/write authorization from `/api/thread-actors`. On HTTP 401 it lets `amp usage` refresh the CLI's own credentials once, then rereads the active credential. It never reads/copies refresh tokens or tries a different account. HTTP 403 is not bypassed. `AMP_URL` and `XDG_DATA_HOME` follow the CLI environment.
+
+`create_thread` makes the same `createRemoteExecutorThread` request as `amp -ox` (checked against Amp on 28 October 2026), with the same credential and refresh, and resolves `project` or cwd's remotes with `amp projects get` or `amp projects status`. Amp cannot label a thread's first message, so the thread opens with a hidden placeholder naming the Pi session, and the task follows at once as a labelled message. Messages carry Amp's `generatedByPlugin` label and a hidden text block; Amp's app does not display a message whose text is all hidden.
 
 The public page's `threadActorConfig.baseURL` string is parsed as data only. No downloaded JavaScript executes. The observer opens Node's built-in WebSocket to that Rivet gateway with the same `threadActor` key route the Rivet client used (checked against Amp on 14 October 2026); short-lived tokens and endpoint credentials remain in memory. Discovery changes fail clearly. Reconnection obtains a fresh token and synchronizes a snapshot plus resume acknowledgement before reporting live state. There is no `amp top`, intermediary Amp model, background wait process, periodic status sweep, or executor attachment.
 

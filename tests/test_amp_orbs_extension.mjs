@@ -5,7 +5,7 @@ const id = "T-00000000-0000-0000-0000-000000000001";
 const question = (requestId, status = "pending") => ({ requestId, status, method: "ui.select" });
 const plugin = (name, request) => ({ jsonrpc: "2.0", method: "plugin_message", params: { message: { event: `plugin.ui.${name}`, data: { request } } } });
 const agentState = (state, messageId) => ({ jsonrpc: "2.0", method: "agent_state", params: { state, messageId } });
-let snapshot = [{ type: "agent_state", state: "tool_use", messageId: "m1" }, { type: "plugin_message", message: { event: "plugin.ui.snapshot", data: { requests: [question("q1")] } } }];
+let snapshot = [{ type: "agent_state", state: "running_tools", messageId: "m1" }, { type: "plugin_message", message: { event: "plugin.ui.snapshot", data: { requests: [] } } }];
 let acceptMessages = true;
 
 const sockets = [];
@@ -32,32 +32,43 @@ const pi = {
 };
 const statuses = [];
 const ui = { setStatus: (key, value) => statuses.push({ key, value }) };
-const ctx = { ui, sessionManager: { getBranch: () => entries } };
+const sessionId = "01a182cf-a771-70ae-a278-bf133e8dca4e";
+const ctx = { ui, sessionManager: { getBranch: () => entries, getSessionId: () => sessionId } };
 const call = async (name, args, signal) => JSON.parse((await tools.get(name).execute("call", args, signal, undefined, ctx)).content[0].text);
 const tick = () => new Promise((resolve) => setTimeout(resolve, 5));
-ampOrbs(pi, { launch: async () => id, open });
+const launches = [];
+ampOrbs(pi, { launch: async (options) => { launches.push(options); return id; }, open });
 
 await handlers.get("session_start")({}, ctx);
 assert.equal(sockets.length, 0, "an empty session opens no sockets");
-await call("create_thread", { prompt: "literal", cwd: "/tmp", mode: "low" });
+await call("create_thread", { prompt: "literal", cwd: "/tmp", mode: "low", title: "Task" });
+assert.deepEqual(launches, [{ cwd: "/tmp", mode: "low", title: "Task", sessionId }], "the launch carries the session, not the prompt");
+const orb = sockets.at(-1);
+const { content: [task, note], meta } = orb.sent.at(-1).params;
+assert.equal(task.text, "literal", "the prompt is sent literally");
+assert.equal(meta.generatedByPlugin, "Pi 3e8dca4e", "Amp labels the task as from this Pi session");
+assert(note.hidden && note.text.includes(`Pi session \`${sessionId}\``) && !note.text.includes("Start acting"), "a hidden note names the Pi session; only follow-ups say to start acting");
 assert.equal(entries.at(-1).data[0].threadId, id, "launched threads are persisted");
 await tick();
+assert.equal(messages.length, 0, "launching does not wake Pi");
+snapshot = [{ type: "agent_state", state: "tool_use", messageId: "m1" }, { type: "plugin_message", message: { event: "plugin.ui.snapshot", data: { requests: [question("q1")] } } }];
+orb.receive(plugin("request_added", question("q1")));
 assert.equal(messages.length, 1, "a pending question wakes Pi");
 assert.equal(messages[0].options.triggerTurn, true);
-sockets[0].receive(plugin("request_added", question("q1")));
+orb.receive(plugin("request_added", question("q1")));
 assert.equal(messages.length, 1, "the same question does not wake twice");
 assert.equal((await call("get_thread_status", { threadId: id })).questions[0].requestId, "q1");
 
-sockets[0].dispatchEvent(new Event("close"));
+orb.dispatchEvent(new Event("close"));
 assert.equal(messages.length, 1, "a lost connection does not wake Pi");
 assert.match(statuses.at(-1).value, /disconnected/, "a lost connection is visible in status");
 const status = await call("get_thread_status", { threadId: id });
 assert.equal(status.connection, "connected", "reading status reconnects with a fresh authorization");
-assert.equal(sockets.length, 2); assert.equal(messages.length, 1, "the replayed question does not wake again");
+assert.equal(sockets.length, 3); assert.equal(messages.length, 1, "the replayed question does not wake again");
 
 acceptMessages = false;
 await assert.rejects(call("send_thread_message", { threadId: id, message: "Red" }), /rejected/);
-assert.deepEqual(sockets.map((s) => s.capability), ["read", "read", "write", "write"], "sending upgrades to write; a rejection rereads the snapshot");
+assert.deepEqual(sockets.map((s) => s.capability), ["read", "write", "write", "write"], "a rejection rereads the snapshot");
 await tick();
 assert.equal((await call("get_thread_status", { threadId: id })).settled, true, "after a rejection the open question still counts");
 
@@ -65,6 +76,8 @@ acceptMessages = true;
 assert.equal((await call("send_thread_message", { threadId: id, message: "Blue" })).accepted, true);
 const sent = sockets.at(-1).sent.at(-1);
 assert.equal(sent.method, "client_append_user_msg"); assert.equal(sent.params.content[0].text, "Blue"); assert.equal(sent.params.steer, true);
+assert.equal(sent.params.meta.generatedByPlugin, "Pi 3e8dca4e", "follow-ups are labelled as from this Pi session");
+assert(sent.params.content[1].hidden && sent.params.content[1].text.includes("Start acting on it without first replying to it in text."));
 assert.equal((await call("wait_for_threads", { threads: [id], timeout_seconds: 0.01 })).timedOut, true, "the answered question no longer settles the thread");
 const waiting = call("wait_for_threads", { threads: [id], timeout_seconds: 5 });
 sockets.at(-1).receive(plugin("request_settled", question("q1", "done")));
@@ -109,7 +122,7 @@ await call("get_thread_status", { threadId: id });
 assert.equal(sockets.length, socketsBeforeRestore + 1, "explicit status read can resume tracking");
 assert.equal(sockets.at(-1).sent[0].method, "client_resume", "unwatch never sends a remote mutation");
 
-await handlers.get("session_tree")({}, { ui, sessionManager: { getBranch: () => [] } });
+await handlers.get("session_tree")({}, { ui, sessionManager: { getBranch: () => [], getSessionId: () => sessionId } });
 assert(sockets.at(-1).closed, "moving to a branch without tracking stops observers");
 // A brief Amp server error while reconnecting is retried quietly.
 {
@@ -118,7 +131,7 @@ assert(sockets.at(-1).closed, "moving to a branch without tracking stops observe
 	let serverErrors = 1; const opened = [];
 	const open3 = async (threadId, capability) => {
 		opened.push(threadId);
-		if (opened.length > 1 && serverErrors-- > 0) throw new Error("Amp actor authorization failed (HTTP 500)");
+		if (opened.length > 2 && serverErrors-- > 0) throw new Error("Amp actor authorization failed (HTTP 500)");
 		return open(threadId, capability);
 	};
 	const pi3 = {
@@ -126,14 +139,14 @@ assert(sockets.at(-1).closed, "moving to a branch without tracking stops observe
 		appendEntry(customType, data) { entries3.push({ type: "custom", customType, data: structuredClone(data) }); },
 		sendMessage(message, options) { messages3.push({ message, options }); },
 	};
-	const ctx3 = { ui: { setStatus() {} }, sessionManager: { getBranch: () => entries3 } };
+	const ctx3 = { ui: { setStatus() {} }, sessionManager: { getBranch: () => entries3, getSessionId: () => sessionId } };
 	ampOrbs(pi3, { launch: async () => flakyId, open: open3 });
 	await handlers3.get("session_start")({}, ctx3);
 	snapshot = [{ type: "agent_state", state: "running_tools", messageId: "m1" }, { type: "plugin_message", message: { event: "plugin.ui.snapshot", data: { requests: [] } } }];
 	await tools3.get("create_thread").execute("call", { prompt: "literal", cwd: "/tmp", mode: "low" }, undefined, undefined, ctx3); await tick();
 	sockets.at(-1).dispatchEvent(new Event("close"));
 	await new Promise((resolve) => setTimeout(resolve, 3600)); // the close, then one HTTP 500 (1 s, then 2 s backoff)
-	assert.equal(opened.length, 3, "one failed reconnect, then a successful one");
+	assert.equal(opened.length, 4, "launch read and write, one failed reconnect, then a successful one");
 	assert.equal(messages3.length, 0, "a brief server error does not wake Pi");
 	const status = JSON.parse((await tools3.get("get_thread_status").execute("call", { threadId: flakyId }, undefined, undefined, ctx3)).content[0].text);
 	assert.equal(status.connection, "connected", "the observer recovered on its own");
@@ -155,7 +168,7 @@ assert(sockets.at(-1).closed, "moving to a branch without tracking stops observe
 		appendEntry(customType, data) { entries2.push({ type: "custom", customType, data: structuredClone(data) }); },
 		sendMessage(message, options) { messages2.push({ message, options }); },
 	};
-	const ctx2 = { ui: { setStatus: (key, value) => statuses2.push({ key, value }) }, sessionManager: { getBranch: () => entries2 } };
+	const ctx2 = { ui: { setStatus: (key, value) => statuses2.push({ key, value }) }, sessionManager: { getBranch: () => entries2, getSessionId: () => sessionId } };
 	const call2 = async (name, args) => JSON.parse((await tools2.get(name).execute("call", args, undefined, undefined, ctx2)).content[0].text);
 	ampOrbs(pi2, { launch: async () => archivedId, open: open2 });
 	await handlers2.get("session_start")({}, ctx2);

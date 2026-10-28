@@ -71,11 +71,17 @@ export default function ampOrbs(pi: ExtensionAPI, { launch = launchOrb, open = o
 
 	pi.registerTool({
 		name: "create_thread", label: "Create Amp orb", executionMode: "sequential",
-		description: "Launch a background Amp orb with the exact literal prompt (no intermediary model). Specify absolute local cwd, optional Amp project/repository, and native mode (low/medium/high/ultra or external-agent:claude-code). Tracked questions, errors and settled work wake this Pi session. Native features are passed through, not validated; inspect applied features. Never infer success from idle alone.",
+		description: "Launch a background Amp orb with the exact literal prompt (no intermediary model), sent as a message from this Pi session rather than the user. Specify absolute local cwd, optional Amp project/repository, and native mode (low/medium/high/ultra or external-agent:claude-code). Tracked questions, errors and settled work wake this Pi session. Native features are passed through, not validated; inspect applied features. Never infer success from idle alone.",
 		parameters: Type.Object({ prompt: Type.String({ minLength: 1 }), cwd: Type.String(), mode: Type.String({ minLength: 1 }), title: Type.Optional(Type.String()), project: Type.Optional(Type.String()), features: Type.Optional(Type.Array(Type.String())) }),
-		async execute(_id, args, signal) {
+		async execute(_id, { prompt, ...args }, signal, _onUpdate, ctx) {
 			if (!isAbsolute(args.cwd)) throw new Error("cwd must be an absolute local directory; project selects the orb repository");
-			const thread = get(await launch(args, signal));
+			const sessionId = ctx.sessionManager.getSessionId();
+			const id = await launch({ ...args, sessionId }, signal);
+			const thread = get(id);
+			await thread.send(prompt, { sessionId, opening: true }, signal).catch((error) => {
+				throw new Error(`Amp orb ${id} was created but its task was not delivered (${error.message}). Read get_thread_status before sending the task with send_thread_message.`);
+			});
+			save();
 			return result({ ...thread.state.status, requestedMode: args.mode, requestedFeatures: args.features ?? [] });
 		},
 	});
@@ -92,10 +98,10 @@ export default function ampOrbs(pi: ExtensionAPI, { launch = launchOrb, open = o
 	});
 	pi.registerTool({
 		name: "send_thread_message", label: "Message Amp thread", executionMode: "sequential",
-		description: "Send a literal message directly to the Amp orb, steering its next turn or answering a normal pending question. Re-arms background notification. Does not approve tools or bypass requiresHuman questions: resolve those in Amp. An acknowledgement means accepted, not completed. If delivery is uncertain, read status before retrying.",
+		description: "Send a literal message directly to the Amp orb as a message from this Pi session, steering its next turn or answering a normal pending question. Re-arms background notification. Does not approve tools or bypass requiresHuman questions: resolve those in Amp. An acknowledgement means accepted, not completed. If delivery is uncertain, read status before retrying.",
 		parameters: Type.Object({ threadId, message: Type.String({ minLength: 1 }) }),
-		async execute(_id, args, signal) {
-			const ack = await get(args.threadId).send(args.message, signal);
+		async execute(_id, args, signal, _onUpdate, ctx) {
+			const ack = await get(args.threadId).send(args.message, { sessionId: ctx.sessionManager.getSessionId(), opening: false }, signal);
 			save();
 			return result({ threadId: args.threadId, ...ack });
 		},
