@@ -17,7 +17,21 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  startup:
+  portable:
+    # The locked dependency tree includes a macOS-only Computer Use package.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+          check-latest: true
+          cache: npm
+      - run: npm install -g npm@latest
+      - run: npm ci
+      - run: python3 tests/ci.py portable
+
+  macos:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -28,64 +42,21 @@ jobs:
           cache: npm
       - run: npm install -g npm@latest
       - run: npm install -g --before "$(node -p 'require("./package.json").piDependencyCutoff')" "@earendil-works/pi-coding-agent@$(node -p 'require("./package.json").devDependencies["@earendil-works/pi-coding-agent"]')"
-      # What laptops get: production dependencies only.
-      - run: npm install --omit=dev
+      # Verify the production-only install before adding development dependencies.
+      - run: npm ci --omit=dev
       - run: python3 tests/startup_check.py
       - run: python3 tests/test_feature_startup.py
-      # Type checking and unit tests also need dev dependencies, including the pinned Pi.
-      - run: npm install
-      - run: npm run typecheck
-      - run: python3 tests/test_node_version.py
-      - run: python3 tests/test_public_release.py
-      - run: npx jiti tests/test_bundled.mjs
-      - run: npx jiti tests/test_features.mjs
-      - run: node --test tests/test_amp_orbs.mjs
-      - run: npx jiti tests/test_amp_orbs_extension.mjs
-      - run: npx jiti tests/test_claude_artifacts.mjs
-      - run: node tests/test_tips.mjs
-      - run: node tests/test_send_approval.mjs
-      - run: node tests/test_update_status.mjs
-      - run: node tests/test_sync_settings.mjs
-      - run: node tests/test_oracle_context.mjs
-      - run: node tests/test_cache_safe_prompts.mjs
-      - run: node tests/test_wut.mjs
-      - run: node tests/test_park.mjs
-      - run: python3 -m unittest discover -s tests -p test_park_terminal.py
-      - run: node tests/test_fast_mode.mjs
-      - run: node --test tests/test_granola_mcp_fetch.mjs
-      - run: bash tests/test_home_command.sh
-      - run: python3 tests/test_home_update.py
-      - run: npm run test:anthropic-gzip
-      # The slow tests mostly wait on Pi and git, so they run side by side. Each has its own scratch
-      # folder and tmux server. A test's output is printed once all of them have finished.
-      - name: vibes check, vibes inventory and update_repo tests
-        run: |
-          brew install tmux bat git-delta glow
-          tests=(test_vibes_check test_vibes_inventory test_update_repo)
-          pids=()
-          for test in "${tests[@]}"; do
-            tests/$test.sh >"$RUNNER_TEMP/$test.log" 2>&1 &
-            pids+=($!)
-          done
-          failed=0
-          for i in "${!tests[@]}"; do
-            if wait "${pids[$i]}"; then result=passed; else result=FAILED; failed=1; fi
-            echo "::group::${tests[$i]} $result"
-            cat "$RUNNER_TEMP/${tests[$i]}.log"
-            echo "::endgroup::"
-          done
-          exit $failed
-      - run: python3 tests/test_inventory.py
-      - run: python3 tests/test_telemetry_destination.py
-      - run: PATH=/usr/bin:/bin:/usr/sbin /usr/bin/python3 tests/test_telemetry_destination.py
-      - run: python3 tests/test_usage_telemetry.py
-      - run: python3 tests/test_refresh.py
-      - run: bash tests/test_refresh_job.sh
-      - run: tests/test_vibes_sources.sh
-      - run: tests/test_update_steps.sh
-      - run: node tests/test_pi_1_migration.mjs
-      - run: tests/test_hotfix.sh
-      - run: node tests/test_rolling_packages.mjs
-      - run: tests/test_install_pinned_pi.sh
-      - run: python3 tests/test_papercut.py
-      - run: brew install uv && python3 tests/test_chrome_cookies.py
+      - run: npm ci
+      - run: brew install tmux bat git-delta glow uv
+      - run: python3 tests/ci.py macos
+
+  startup:
+    if: always()
+    needs: [portable, macos]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require both check suites
+        env:
+          PORTABLE: ${{ needs.portable.result }}
+          MACOS: ${{ needs.macos.result }}
+        run: test "$PORTABLE" = success && test "$MACOS" = success

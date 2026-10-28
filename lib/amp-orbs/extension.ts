@@ -2,47 +2,114 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { Type } from "typebox";
 import { isAbsolute } from "node:path";
 import { launch as launchOrb, openActor, ThreadConnection, waitFor } from "./connection.ts";
-import type { Checkpoint } from "./protocol.ts";
+import type { Checkpoint, ThreadStatus } from "./protocol.ts";
 
 const entryType = "amp-orbs-tracking";
+const holdEntryType = "amp-orbs-wake-hold";
 const threadId = Type.String({ pattern: "^T-[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$" });
 const result = (data: unknown) => ({ content: [{ type: "text" as const, text: JSON.stringify(data) }], details: structuredClone(data) });
 type Tracked = Checkpoint & { threadId: string };
+type WakeHold = { failures: number; until: number };
 
-export default function ampOrbs(pi: ExtensionAPI, { launch = launchOrb, open = openActor } = {}) {
+// agent-default (not a user rule): 2026-10-22. How long an orb's new state must hold before it wakes
+// Pi, so Amp's retries, reconnects and brief error states settle first.
+const defaultQuietMs = 20_000;
+// agent-default (not a user rule): 2026-10-22. After Pi's own model call fails (for example a 429),
+// wake-ups wait this long before trying again, growing with each further failure. A successful reply
+// from the user's next message ends the wait at once.
+const defaultHoldMs = [5 * 60_000, 15 * 60_000, 60 * 60_000];
+
+const describe = (status: ThreadStatus) => {
+	const reason = status.error || status.connectionError ? "failed" : status.questions.length ? "needs input" : status.approvals.length ? "needs approval in Amp" : "stopped (verify its result)";
+	return [
+		`Amp orb ${reason}: ${status.url}`,
+		status.error ?? status.connectionError,
+		status.questions.length || status.approvals.length ? "Read get_thread_status for the pending questions or approvals. Do not bypass human approval." : undefined,
+		status.response,
+	].filter(Boolean).join("\n\n");
+};
+
+/**
+ * Orb updates wait here, never in Pi's follow-up queue, where they could not be merged, dropped when
+ * a thread is no longer watched, or matched against what Pi already read. While Pi works, nothing is
+ * sent. Once Pi is idle, every orb whose new state has held for the quiet period goes out in one
+ * message, which starts one turn.
+ */
+export default function ampOrbs(pi: ExtensionAPI, { launch = launchOrb, open = openActor, quietMs = defaultQuietMs, holdMs = defaultHoldMs } = {}) {
 	const threads = new Map<string, ThreadConnection>();
+	// When each thread's unseen state was first observed. An entry outlives brief absences (a reconnect
+	// replay, a short burst of work), so the same state returning keeps its original time.
+	const since = new Map<string, { identity: string; at: number }>();
+	const current = () => [...since].filter(([id, s]) => threads.get(id)?.state.unseen().join() === s.identity);
+	let hold: WakeHold | undefined;
+	let timer: ReturnType<typeof setTimeout> | undefined;
 	let context: ExtensionContext | undefined;
+	const held = () => Boolean(hold && Date.now() < hold.until);
 	const updateStatus = () => {
 		const disconnected = [...threads.values()].filter((thread) => thread.state.status.connection === "disconnected").length;
-		context?.ui.setStatus("amp-orbs", threads.size ? `Amp: ${threads.size} watched${disconnected ? `, ${disconnected} disconnected` : ""}` : undefined);
+		const waiting = held() ? current().length : 0;
+		context?.ui.setStatus("amp-orbs", threads.size ? `Amp: ${threads.size} watched${disconnected ? `, ${disconnected} disconnected` : ""}${waiting ? `, ${waiting} held after a model error` : ""}` : undefined);
 	};
 	const save = () => pi.appendEntry<Tracked[]>(entryType, [...threads].map(([threadId, thread]) => ({ threadId, ...thread.state.checkpoint() })));
+	const schedule = () => {
+		clearTimeout(timer);
+		timer = undefined;
+		const pending = current();
+		if (!pending.length) return;
+		const due = Math.max(Math.min(...pending.map(([, s]) => s.at + quietMs)), held() ? hold!.until : 0);
+		timer = setTimeout(flush, Math.max(0, due - Date.now()));
+	};
+	/** Note a thread's unseen state; a different state starts a new quiet period. */
+	const observe = (id: string, thread: ThreadConnection) => {
+		const identity = thread.state.unseen().join();
+		if (identity && since.get(id)?.identity !== identity) since.set(id, { identity, at: Date.now() });
+		schedule();
+	};
+	/** Pi read these threads in a tool result, so it needs no wake-up for what it saw. */
+	const seen = (watched: ThreadConnection[]) => {
+		if (watched.map((thread) => thread.state.markSeen()).some(Boolean)) save();
+		for (const thread of watched) since.delete(thread.state.status.threadId);
+		schedule();
+	};
+	const flush = () => {
+		// While Pi works, wait for agent_settled (or compaction) to flush rather than polling.
+		if (!context?.isIdle()) return;
+		if (held()) return schedule();
+		const now = Date.now();
+		const ready = current().filter(([, s]) => now - s.at >= quietMs).map(([id]) => threads.get(id)!);
+		if (!ready.length) return schedule();
+		for (const thread of ready) { thread.state.markSeen(); since.delete(thread.state.status.threadId); }
+		save();
+		const statuses = ready.map((thread) => structuredClone(thread.state.status));
+		const content = statuses.length === 1 ? describe(statuses[0]) : [`${statuses.length} Amp orb updates:`, ...statuses.map(describe)].join("\n\n---\n\n");
+		pi.sendMessage({ customType: "amp-orb-update", content, display: true, details: { threads: statuses } }, { triggerTurn: true, deliverAs: "followUp" });
+		updateStatus();
+		schedule();
+	};
 	const untrack = (id: string) => {
 		const thread = threads.get(id);
 		thread?.stop();
 		threads.delete(id);
+		since.delete(id);
 		save();
 		updateStatus();
+		schedule();
 		return Boolean(thread);
 	};
 	const track = (id: string, checkpoint?: Checkpoint) => {
 		const thread = new ThreadConnection(id, checkpoint, open);
 		threads.set(id, thread);
+		let observedCheckpoint = thread.state.checkpoint();
 		thread.subscribe(() => {
+			if (threads.get(id) !== thread) return;
 			// An archived thread is finished: stop watching it quietly. A later status read or message re-checks it.
-			if (thread.state.status.archived) { if (threads.get(id) === thread) untrack(id); return; }
+			if (thread.state.status.archived) { untrack(id); return; }
+			// Persist observed new work before its outcome: a reload must not restore the previous
+			// episode's completed identity and silently discard this episode's eventual result.
+			const next = thread.state.checkpoint();
+			if (next.episode !== observedCheckpoint.episode || next.userMessageId !== observedCheckpoint.userMessageId) { observedCheckpoint = next; save(); }
+			observe(id, thread);
 			updateStatus();
-			if (!thread.state.notification()) return;
-			save();
-			const status = thread.state.status;
-			const reason = status.error || status.connectionError ? "failed" : status.questions.length ? "needs input" : status.approvals.length ? "needs approval in Amp" : "stopped (verify its result)";
-			const content = [
-				`Amp orb ${reason}: ${status.url}`,
-				status.error ?? status.connectionError,
-				status.questions.length || status.approvals.length ? "Read get_thread_status for the pending questions or approvals. Do not bypass human approval." : undefined,
-				status.response,
-			].filter(Boolean).join("\n\n");
-			pi.sendMessage({ customType: "amp-orb-update", content, display: true, details: structuredClone(status) }, { triggerTurn: true, deliverAs: "followUp" });
 		});
 		thread.start();
 		return thread;
@@ -57,17 +124,36 @@ export default function ampOrbs(pi: ExtensionAPI, { launch = launchOrb, open = o
 	const stopAll = () => {
 		for (const thread of threads.values()) thread.stop();
 		threads.clear();
+		since.clear();
+		clearTimeout(timer);
 		updateStatus();
 	};
 	const restore = (ctx: ExtensionContext) => {
 		stopAll();
 		context = ctx;
-		const entry = ctx.sessionManager.getBranch().findLast((e) => e.type === "custom" && e.customType === entryType);
+		const branch = ctx.sessionManager.getBranch();
+		const savedHold = branch.findLast((e) => e.type === "custom" && e.customType === holdEntryType);
+		// Deadlines and failure counts belong to the active branch, not the extension instance.
+		hold = savedHold?.type === "custom" ? (savedHold.data as WakeHold | null) ?? undefined : undefined;
+		const entry = branch.findLast((e) => e.type === "custom" && e.customType === entryType);
 		for (const item of (entry?.type === "custom" ? entry.data : []) as Tracked[]) track(item.threadId, item);
 	};
 	pi.on("session_start", async (_event, ctx) => restore(ctx));
 	pi.on("session_tree", async (_event, ctx) => restore(ctx));
 	pi.on("session_shutdown", async () => stopAll());
+	// Pi has finished its run and nothing else is queued. If its last model call failed after its own
+	// retries, every wake-up would fail the same way, so hold them instead of starting doomed turns.
+	pi.on("agent_settled", async (_event, ctx) => {
+		const last = ctx.sessionManager.getBranch().findLast((e) => e.type === "message" && e.message.role === "assistant");
+		const failed = last?.type === "message" && last.message.role === "assistant" && last.message.stopReason === "error";
+		const failures = failed ? (hold?.failures ?? 0) + 1 : 0;
+		hold = failures ? { failures, until: Date.now() + holdMs[Math.min(failures, holdMs.length) - 1] } : undefined;
+		pi.appendEntry<WakeHold | null>(holdEntryType, hold ?? null);
+		updateStatus();
+		flush();
+	});
+	pi.on("session_compact", async () => flush());
+	pi.on("session_compact_failed", async () => flush());
 
 	pi.registerTool({
 		name: "create_thread", label: "Create Amp orb", executionMode: "sequential",
@@ -82,6 +168,7 @@ export default function ampOrbs(pi: ExtensionAPI, { launch = launchOrb, open = o
 				throw new Error(`Amp orb ${id} was created but its task was not delivered (${error.message}). Read get_thread_status before sending the task with send_thread_message.`);
 			});
 			save();
+			seen([thread]);
 			return result({ ...thread.state.status, requestedMode: args.mode, requestedFeatures: args.features ?? [] });
 		},
 	});
@@ -93,6 +180,7 @@ export default function ampOrbs(pi: ExtensionAPI, { launch = launchOrb, open = o
 			const thread = get(args.threadId);
 			// A failed connection is reported in the status itself.
 			await thread.ready(signal).catch((error) => { if (signal?.aborted) throw error; });
+			if (threads.get(args.threadId) === thread) seen([thread]);
 			return result(thread.state.status);
 		},
 	});
@@ -121,6 +209,7 @@ export default function ampOrbs(pi: ExtensionAPI, { launch = launchOrb, open = o
 		async execute(_id, args, signal) {
 			const watched = args.threads.map(get);
 			const settled = await waitFor(watched, () => watched.every((t) => t.state.status.settled), signal, (args.timeout_seconds ?? 300) * 1000);
+			seen(watched.filter((t) => threads.get(t.state.status.threadId) === t));
 			return result({ timedOut: !settled, threads: watched.map((t) => t.state.status) });
 		},
 	});
