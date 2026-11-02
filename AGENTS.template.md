@@ -49,7 +49,9 @@ Vibes owns its managed extensions, skills and prompts: `/onboard` and the startu
 - The home defaults use `openai-codex`, including `openai-codex/gpt-6-astra`; sign in with `/login openai-codex`. Preserve a working provider. The new `/login openai` → **Sign in with ChatGPT** subscription-sharing flow is an optional route for eligible Plus/Pro users, not a required migration. Change provider only when the user chooses it and a real model/tool request succeeds; never copy credentials between providers.
 - `anthropic/claude-opus-5-5` (high thinking): writing, UX judgement, product sense and design taste.
 - `anthropic/claude-fable-5-1` (high thinking): bold ideation and inventive prototypes.
-- Delegation to subagents is authorised without asking: `worker` for bounded work that can run alongside yours, `oracle` for a second opinion. They run in the background; do not edit files a running worker owns.
+- Delegation to subagents is authorised without asking.
+- Use subagents for independent second opinions or parallel work: tasks you can fan out, or a bounded task that runs alongside your own substantive work. Otherwise, work directly. Avoid a single parent managing a single worker when the parent adds no substantive work beyond waiting, monitoring or relaying results.
+- Use `worker` for bounded work and `oracle` for a second opinion. They run in the background; do not edit files a running worker owns.
 
 ## Personal configuration
 
