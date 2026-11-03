@@ -53,7 +53,7 @@ ampOrbs(pi, { launch: async (options) => { launches.push(options); return id; },
 await handlers.get("session_start")({}, ctx);
 assert.equal(sockets.length, 0, "an empty session opens no sockets");
 await call("create_thread", { prompt: "literal", cwd: "/tmp", mode: "low", title: "Task" });
-assert.deepEqual(launches, [{ cwd: "/tmp", mode: "low", title: "Task", sessionId }], "the launch carries the session, not the prompt");
+assert.deepEqual(launches, [{ cwd: "/tmp", mode: "low", title: "Task", prompt: "literal", sessionId }], "the launch carries the literal task and Pi session");
 const orb = sockets.at(-1);
 const { content: [task, note], meta } = orb.sent.at(-1).params;
 assert.equal(task.text, "literal", "the prompt is sent literally");
@@ -352,12 +352,32 @@ await test("a cold idle observer loads the last reply before returning status", 
 	assert.equal(status.settled, true);
 });
 
+await test("external-agent creation observes the task without sending it a second time", async (t) => {
+	const session = wakeSession();
+	t.after(async () => session.stop());
+	snapshot = replay("idle", "external-reply", "EXTERNAL DONE");
+	await session.start();
+	const before = sockets.length;
+	const status = await session.call("create_thread", {
+		cwd: "/tmp", mode: "external-agent:claude-code", prompt: "literal external task",
+		features: ["model:claude-opus-5-5", "effort:high"],
+	});
+	assert.equal(status.connection, "connected");
+	assert.equal(status.response, "EXTERNAL DONE", "a fast reply is not invalidated by rearming an already delivered task");
+	assert.equal(status.settled, true);
+	assert.deepEqual(sockets.slice(before).flatMap((s) => s.sent.map((f) => f.method)), ["client_resume"], "creation must not append a duplicate prompt");
+	await tick();
+	assert.equal(session.messages.length, 0, "a result read at creation does not wake Pi again");
+	await session.call("send_thread_message", { threadId: id, message: "Follow up" });
+	assert.equal(sockets.at(-1).sent.at(-1).params.content[0].text, "Follow up", "external threads still accept steering");
+});
+
 await test("reload retains an observed new episode without repeating a read or delivered result", async (t) => {
 	const advance = () => new Promise((resolve) => setTimeout(resolve, 20));
 	let session = wakeSession();
 	t.after(async () => session.stop());
 	snapshot = replay("working", "m1", "working");
-	await session.start(); await session.call("create_thread", { cwd: "/tmp" }); await advance();
+	await session.start(); await session.call("create_thread", { cwd: "/tmp", mode: "low", prompt: "literal" }); await advance();
 	session.event(replay("idle", "m2", "FIRST")); await advance();
 	assert.equal(session.messages.length, 1);
 	session.event(agentState("working", "m3"));
@@ -414,7 +434,7 @@ await test("reload preserves hold deadlines and the 5, 15, 60, 60 progression", 
 	let session = wakeSession();
 	t.after(async () => session.stop());
 	snapshot = replay("working", "m0", "working");
-	await session.start(); await session.call("create_thread", { cwd: "/tmp" }); await advance(20);
+	await session.start(); await session.call("create_thread", { cwd: "/tmp", mode: "low", prompt: "literal" }); await advance(20);
 	// Scale minutes down to 20 ms, with room on either side of each deadline for real timers.
 	for (const [index, duration] of [100, 300, 1200, 1200].entries()) {
 		const failedAt = Date.now();
@@ -436,7 +456,7 @@ await test("reload preserves hold deadlines and the 5, 15, 60, 60 progression", 
 	session.event(agentState("working", "held-work")); session.event(replay("idle", "held-done", "HELD"));
 	await advance(20); const heldBranch = session.entries;
 	snapshot = replay("working", "other-work", "other");
-	await session.tree([]); await session.call("create_thread", { cwd: "/tmp" }); await advance(20);
+	await session.tree([]); await session.call("create_thread", { cwd: "/tmp", mode: "low", prompt: "literal" }); await advance(20);
 	session.event(replay("idle", "other-done", "OTHER")); await advance(20);
 	assert.equal(session.messages.length, 2, "another branch does not inherit the original hold");
 	assert.match(session.messages[1].content, /OTHER/);

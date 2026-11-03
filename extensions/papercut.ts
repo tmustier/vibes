@@ -4,7 +4,7 @@ import { stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { VERSION, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type, type Static } from "typebox";
 
@@ -57,12 +57,6 @@ type CaptureResult = {
   metadata?: Record<string, unknown>;
 };
 
-async function piVersion(pi: ExtensionAPI, signal?: AbortSignal): Promise<string | undefined> {
-  const result = await pi.exec("pi", ["--version"], { signal, timeout: 5_000 });
-  const version = result.stdout.trim();
-  return result.code === 0 && version ? version : undefined;
-}
-
 export default feature(import.meta.url, (pi: ExtensionAPI) => {
   if (registeredApis.has(pi)) return;
   registeredApis.add(pi);
@@ -99,7 +93,6 @@ export default feature(import.meta.url, (pi: ExtensionAPI) => {
       const entries = ctx.sessionManager.getEntries();
       const branch = ctx.sessionManager.getBranch();
       const sessionStat = sessionFile ? await stat(sessionFile).catch(() => undefined) : undefined;
-      const version = await piVersion(pi, signal).catch(() => undefined);
       const model = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "unknown";
 
       const metadata = {
@@ -112,7 +105,8 @@ export default feature(import.meta.url, (pi: ExtensionAPI) => {
         sessionBytes: sessionStat?.size ?? null,
         sessionEntries: entries.length,
         branchEntries: branch.length,
-        piVersion: version,
+        // The Pi running this session; `pi --version` would report whatever is on disk now.
+        piVersion: VERSION,
         surface: params.surface,
       };
 

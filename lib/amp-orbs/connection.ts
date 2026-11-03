@@ -174,11 +174,10 @@ export class ThreadConnection {
 		const id = ++this.requestId;
 		const messageId = `M-${randomUUID().replaceAll("-", "").slice(0, 22)}`;
 		this.state.rearm();
-		const note = `\n\nThread message metadata: this message was sent by Pi session \`${sessionId}\`, an agent on the user's computer, not directly by the user.${opening ? "" : " Start acting on it without first replying to it in text."} Unless you delegated the work to it, do not add its changes to your work without the user's approval. Pi watches this thread and reads your final response, so include the outcome and anything Pi must decide or act on there.`;
 		// Amp shows the label as "Message from Pi <id> plugin". agent-default (not a user rule): 2026-10-28. The last
 		// 8 characters of the session ID tell sessions apart; its start is a timestamp that sessions share.
 		const meta = { generatedByPlugin: `Pi ${sessionId.slice(-8)}` };
-		const content = [{ type: "text", text }, { type: "text", text: note, hidden: true }];
+		const content = piContent(text, { sessionId, opening });
 		this.socket!.send(JSON.stringify({ jsonrpc: "2.0", id, method: "client_append_user_msg", params: { content, meta, agentMode: this.state.status.agentMode, messageId, steer: true } }));
 		const accepted = await new Promise<boolean>((resolve, reject) => {
 			this.pending.set(id, { resolve, reject });
@@ -196,12 +195,17 @@ export class ThreadConnection {
 }
 
 export type PiSender = { sessionId: string; opening: boolean };
-type LaunchOptions = { cwd: string; mode: string; title?: string; project?: string; features?: string[]; sessionId: string };
+function piContent(text: string, { sessionId, opening }: PiSender) {
+	const note = `\n\nThread message metadata: this message was sent by Pi session \`${sessionId}\`, an agent on the user's computer, not directly by the user.${opening ? "" : " Start acting on it without first replying to it in text."} Unless you delegated the work to it, do not add its changes to your work without the user's approval. Pi watches this thread and reads your final response, so include the outcome and anything Pi must decide or act on there.`;
+	return [{ type: "text", text }, { type: "text", text: note, hidden: true }];
+}
+type LaunchOptions = { cwd: string; mode: string; prompt: string; title?: string; project?: string; features?: string[]; sessionId: string };
 /**
  * Create an orb as `amp -ox` does, in the named project or else the one matching cwd's Git remotes. Amp cannot
- * label a thread's first message, so the thread opens with a hidden placeholder and the caller sends the task next.
+ * label a thread's first message. Native threads use a placeholder before the caller sends the labelled task;
+ * external agents require the actual task at creation, with Pi attribution in its hidden metadata instead.
  */
-export async function launch({ cwd, mode, title, project, features = [], sessionId }: LaunchOptions, signal?: AbortSignal): Promise<string> {
+export async function launch({ cwd, mode, prompt, title, project, features = [], sessionId }: LaunchOptions, signal?: AbortSignal): Promise<string> {
 	const projects = (args: string[]) => amp(["projects", ...args, "--json"], { cwd, signal, timeout: 30000 }).then(JSON.parse);
 	const projectID: string | null = project
 		? (await projects(["get", project]).catch(() => { throw new Error(`No accessible Amp project matches ${project}`); })).id
@@ -211,7 +215,8 @@ export async function launch({ cwd, mode, title, project, features = [], session
 		});
 	const params = {
 		agentMode: mode, features, projectID, executeMode: true, title,
-		content: [{ type: "text", text: `Pi session \`${sessionId}\` is starting this thread. Its first message follows immediately; do not reply to this one.`, hidden: true }],
+		content: mode.startsWith("external-agent:") ? piContent(prompt, { sessionId, opening: true })
+			: [{ type: "text", text: `Pi session \`${sessionId}\` is starting this thread. Its first message follows immediately; do not reply to this one.`, hidden: true }],
 		userState: { currentlyVisibleFiles: [], timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone },
 		threadMeta: { visibility: "thread_workspace_shared" },
 	};

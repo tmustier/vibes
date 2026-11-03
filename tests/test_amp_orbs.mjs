@@ -370,28 +370,48 @@ test("only Amp's THREAD_ARCHIVED code marks a thread archived", async () => {
 	authorizations.splice(0);
 });
 
-test("launch creates the orb as amp -ox does, opening with a hidden placeholder for Pi's labelled task", async () => {
+test("native launch opens with a hidden placeholder for Pi's labelled task", async () => {
 	const sessionId = "01a182cf-a771-70ae-a278-bf133e8dca4e";
-	const options = { cwd: scratch, mode: "external-agent:claude-code", title: "Task", features: ["model:claude-opus-5-5", "effort:high"], sessionId };
+	const options = { cwd: scratch, mode: "low", prompt: "Literal task", title: "Task", features: [], sessionId };
 	created.push({ ok: true, result: { threadID: id } });
 	assert.equal(await launch({ ...options, project: "org/repo" }), id);
 	const [{ authorization, method, params: { content: [placeholder, ...rest], userState: _, ...params } }] = creations.splice(0);
 	assert.equal(authorization, "Bearer personal", "the active CLI account creates the orb");
 	assert.equal(method, "createRemoteExecutorThread");
 	assert.deepEqual(params, {
-		agentMode: "external-agent:claude-code", features: ["model:claude-opus-5-5", "effort:high"], projectID: "project-named",
+		agentMode: "low", features: [], projectID: "project-named",
 		executeMode: true, title: "Task", threadMeta: { visibility: "thread_workspace_shared" },
 	});
 	assert.deepEqual(rest, [], "the prompt is not part of the launch");
 	assert(placeholder.hidden && placeholder.text.includes(sessionId), "the thread opens with a hidden placeholder naming the Pi session");
-	for (const [status, projectID] of [["matched", "project-inferred"], ["unmatched", null]]) {
+	for (const [mode, status, projectID] of [["low", "matched", "project-inferred"], ["medium", "unmatched", null], ["high", "matched", "project-inferred"]]) {
 		fs.writeFileSync(path.join(scratch, "project-status"), status); created.push({ ok: true, result: { threadID: id } });
-		await launch(options);
-		assert.equal(creations.splice(0)[0].params.projectID, projectID, "without a project, cwd's Git remotes choose it");
+		await launch({ ...options, mode });
+		const { params } = creations.splice(0)[0];
+		assert.equal(params.projectID, projectID, "without a project, cwd's Git remotes choose it");
+		assert.equal(params.agentMode, mode);
+		assert.deepEqual(params.content, [placeholder], `${mode} keeps the hidden placeholder before the labelled task`);
 	}
 	await assert.rejects(launch({ ...options, project: "missing/repo" }), /No accessible Amp project matches missing\/repo/);
 	assert.equal(creations.length, 0, "an unknown project creates nothing");
 	created.push({ ok: false, error: { code: "invalid-params", message: "Unknown agent mode" } });
 	await assert.rejects(launch(options), /Amp refused to create the orb: Unknown agent mode/);
+	creations.splice(0);
 	authorizations.splice(0);
+});
+
+test("external-agent launch includes the literal task and Pi attribution at creation", async () => {
+	const sessionId = "01a182cf-a771-70ae-a278-bf133e8dca4e";
+	const prompt = "Read this literal task\nwithout changing it.";
+	const features = ["model:claude-opus-5-5", "effort:high"];
+	created.push({ ok: true, result: { threadID: id } });
+	assert.equal(await launch({ cwd: scratch, mode: "external-agent:claude-code", project: "org/repo", prompt, features, sessionId }), id);
+	const { params } = creations.splice(0)[0];
+	assert.equal(params.agentMode, "external-agent:claude-code");
+	assert.deepEqual(params.features, features);
+	const [task, note] = params.content;
+	assert.deepEqual(task, { type: "text", text: prompt }, "external agents need a visible prompt in the creation request");
+	assert(note.hidden && note.text.includes(`Pi session \`${sessionId}\``));
+	assert(note.text.includes("not directly by the user") && note.text.includes("Pi watches this thread"));
+	assert(!note.text.includes("Start acting"), "the opening note is not follow-up steering");
 });

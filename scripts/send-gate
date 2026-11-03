@@ -19,18 +19,21 @@
 set -euo pipefail
 
 GRACE_PERIOD="${SEND_GATE_GRACE:-60}"
-CMD=("$@")
 
-if [[ ${#CMD[@]} -eq 0 ]]; then
+if [[ $# -eq 0 || ( $# -eq 1 && ( $1 == --help || $1 == -h ) ) ]]; then
   echo "Usage: send-gate <command> [args...]"
   echo ""
   echo "Wraps an outbound email command with a preview and"
   echo "${GRACE_PERIOD}s grace period before executing."
   echo ""
   echo "Set SEND_GATE_GRACE=N to change the grace period (seconds)."
-  exit 1
+  if [[ $# -eq 0 ]]; then
+    exit 1
+  fi
+  exit 0
 fi
 
+CMD=("$@")
 echo "══════════════════════════════════════════════════════"
 echo "📤  OUTBOUND EMAIL — REVIEW BEFORE SENDING"
 echo "══════════════════════════════════════════════════════"

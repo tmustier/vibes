@@ -159,14 +159,19 @@ export default function ampOrbs(pi: ExtensionAPI, { launch = launchOrb, open = o
 		name: "create_thread", label: "Create Amp orb", executionMode: "sequential",
 		description: "Launch a background Amp orb with the exact literal prompt (no intermediary model), sent as a message from this Pi session rather than the user. Specify absolute local cwd, optional Amp project/repository, and native mode (low/medium/high/ultra or external-agent:claude-code). Tracked questions, errors and settled work wake this Pi session. Native features are passed through, not validated; inspect applied features. Never infer success from idle alone.",
 		parameters: Type.Object({ prompt: Type.String({ minLength: 1 }), cwd: Type.String(), mode: Type.String({ minLength: 1 }), title: Type.Optional(Type.String()), project: Type.Optional(Type.String()), features: Type.Optional(Type.Array(Type.String())) }),
-		async execute(_id, { prompt, ...args }, signal, _onUpdate, ctx) {
+		async execute(_id, args, signal, _onUpdate, ctx) {
 			if (!isAbsolute(args.cwd)) throw new Error("cwd must be an absolute local directory; project selects the orb repository");
 			const sessionId = ctx.sessionManager.getSessionId();
 			const id = await launch({ ...args, sessionId }, signal);
 			const thread = get(id);
-			await thread.send(prompt, { sessionId, opening: true }, signal).catch((error) => {
-				throw new Error(`Amp orb ${id} was created but its task was not delivered (${error.message}). Read get_thread_status before sending the task with send_thread_message.`);
-			});
+			if (args.mode.startsWith("external-agent:")) {
+				// The task was already delivered at creation. Observe it, never append it twice.
+				await thread.ready(signal).catch((error) => { if (signal?.aborted) throw error; });
+			} else {
+				await thread.send(args.prompt, { sessionId, opening: true }, signal).catch((error) => {
+					throw new Error(`Amp orb ${id} was created but its task was not delivered (${error.message}). Read get_thread_status before sending the task with send_thread_message.`);
+				});
+			}
 			save();
 			seen([thread]);
 			return result({ ...thread.state.status, requestedMode: args.mode, requestedFeatures: args.features ?? [] });
