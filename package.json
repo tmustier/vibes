@@ -4,7 +4,7 @@
   "license": "MIT",
   "description": "Personal Pi setup and starter bundle",
   "type": "module",
-  "piDependencyCutoff": "2026-10-28T17:49:32.744Z",
+  "piDependencyCutoff": "2026-11-03T10:27:37.545Z",
   "scripts": {
     "typecheck": "tsc --noEmit",
     "test:anthropic-gzip": "node --test packages/pi-anthropic-gzip/index.test.ts && node tests/test_anthropic_gzip.mjs",
@@ -23,7 +23,7 @@
     "mitsupi": "1.6.0",
     "pi-codex-goal": "0.6.1",
     "pi-extensions": "0.1.74",
-    "pi-subagents": "0.83.1",
+    "pi-subagents": "github:nicobailon/pi-subagents#343ba73abeaf0a6e942a906ee4333a35f495b757",
     "pi-web-access": "0.45.0",
     "pi-you-should-know": "git+https://github.com/tmustier/pi-you-should-know.git#4ffceda99b625b633a1ea4fd0a253740947759da",
     "pine-of-glass": "0.18.4",
@@ -42,8 +42,8 @@
     ]
   },
   "devDependencies": {
-    "@earendil-works/pi-ai": "1.4.0",
-    "@earendil-works/pi-coding-agent": "1.4.0",
+    "@earendil-works/pi-ai": "1.5.0",
+    "@earendil-works/pi-coding-agent": "1.5.0",
     "@types/node": "26.6.3",
     "typescript": "7.0.2"
   }

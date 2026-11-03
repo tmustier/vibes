@@ -193,6 +193,12 @@ The Sol compaction override uses `reserveTokens: 50000`: Pi compacts above `5000
 
 If settings sync reports that it kept a personal `compaction` object, inspect it and merge the Sol override explicitly if wanted. Do not replace the whole object or discard other model preferences.
 
+## Pi hangs after a subagent finishes
+
+With Pi's bundled CLI, a foreground child could leave a provider WebSocket open after its task finished. The child released resources in the SDK's registry but missed the host extension's registry, so `pi -p` could print its answer and never exit.
+
+Pi 1.5.0 is paired with pi-subagents commit `343ba73abeaf0a6e942a906ee4333a35f495b757`, which includes the unreleased [upstream fix (#3141)](https://github.com/nicobailon/pi-subagents/pull/3141). Keep the commit pin until an npm release includes the fix. After updating, run `vibes check` and a real subagent task, and confirm the parent process exits normally.
+
 ## Pi 1.0 migration on an existing laptop
 
 Pi 1.0 stores MCP OAuth credentials per server name and URL. The first connection moves credentials stored under a URL alone to that server, after which Pi 0.99.2 may report the server as needing sign-in: do not downgrade without restoring an earlier credential backup. When several server names share one URL, check each account separately.
