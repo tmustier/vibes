@@ -39,6 +39,7 @@ SUITES = {
         "python3 tests/test_usage_telemetry.py",
         "python3 tests/test_refresh.py",
         "python3 tests/test_papercut.py",
+        "python3 tests/test_send_gate.py",
         "bash tests/test_update_repo.sh",
         "node tests/test_pi_1_migration.mjs",
         "node tests/test_rolling_packages.mjs",
