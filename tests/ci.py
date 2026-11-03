@@ -29,7 +29,7 @@ SUITES = {
         "node tests/test_send_approval.mjs",
         "node tests/test_update_status.mjs",
         "node tests/test_sync_settings.mjs",
-        "node tests/test_oracle_context.mjs",
+        "npx --no-install jiti tests/test_oracle_context.mjs",
         "node tests/test_cache_safe_prompts.mjs",
         "node tests/test_wut.mjs",
         "node tests/test_fast_mode.mjs",
