@@ -23,6 +23,7 @@ async function sections(agent) {
 		systemPrompt: `<active_agent name="${agent}"/>\n\nAgent prompt`,
 	});
 	await resourceLoader.reload();
+	assert.deepEqual(resourceLoader.getExtensions().errors, [], "subagents must load before checking the Oracle prompt");
 	const sessionManager = SessionManager.inMemory(agentDir, { parentSession: parent });
 	const { session } = await createAgentSession({ cwd: agentDir, agentDir, modelRuntime, model: faux.getModel(), resourceLoader, sessionManager, settingsManager });
 	await session.prompt("hi");
