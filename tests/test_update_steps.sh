@@ -93,13 +93,13 @@ previous=$(mktemp -d)
 (
 	source scripts/vibes
 	VIBES=$scratch/handover LOG_FILE=$scratch/handover-log STATUS_FILE=$scratch/status.json NOTES_FILE=$scratch/notes VIBES_UPDATE_LOCKED=1
-	for f in load_nvm refresh_rolling_packages sync_settings install_pinned_pi install_hotfix_job install_refresh_job update_repo cmd_check osascript; do eval "$f() { :; }"; done
+	for f in load_nvm refresh_rolling_packages update_surf sync_settings install_pinned_pi install_hotfix_job install_refresh_job update_repo cmd_check osascript; do eval "$f() { :; }"; done
 	mkdir -p "$VIBES/scripts" && printf '#!/bin/bash\n' >"$VIBES/scripts/inventory" && chmod +x "$VIBES/scripts/inventory"
 	cp "$VIBES/scripts/inventory" "$VIBES/scripts/usage-telemetry"
 	export VIBES_UPDATE_CONTINUED=1 VIBES_UPDATE_PREVIOUS=$previous VIBES_UPDATE_RESULTS=$'homebrew\tok\t\nnpm\tfail\texit 1\n'
 	cmd_update
 ) >/dev/null 2>&1
-check "continued: records the handed-over and new steps" '[ "$(node -e "const s=require(process.argv[1]);console.log(s.steps.map(x=>x.name+(x.ok?\"\":\"!\")).join(\" \"))" "$scratch/status.json")" = "homebrew npm! rolling-packages settings pi hotfix-job refresh-job startup telemetry usage-telemetry" ]'
+check "continued: records the handed-over and new steps" '[ "$(node -e "const s=require(process.argv[1]);console.log(s.steps.map(x=>x.name+(x.ok?\"\":\"!\")).join(\" \"))" "$scratch/status.json")" = "homebrew npm! rolling-packages surf settings pi hotfix-job refresh-job startup telemetry usage-telemetry" ]'
 rm -rf "$previous"
 
 # The first update to the Pi 1.0 pin captures the MCP baseline before Pi moves and runs the migration
@@ -115,15 +115,15 @@ migration_update() {
 	(
 		source scripts/vibes
 		VIBES=$scratch/migration LOG_FILE=$scratch/migration-log STATUS_FILE=$scratch/migration-status.json NOTES_FILE=$scratch/migration-notes VIBES_UPDATE_LOCKED=1 PI_1_MARKER=$scratch/migration-marker
-		for f in load_nvm refresh_rolling_packages sync_settings install_pinned_pi install_hotfix_job install_refresh_job update_repo cmd_check osascript capture_pi_1_baseline; do eval "$f() { :; }"; done
+		for f in load_nvm refresh_rolling_packages update_surf sync_settings install_pinned_pi install_hotfix_job install_refresh_job update_repo cmd_check osascript capture_pi_1_baseline; do eval "$f() { :; }"; done
 		run_pi_1_migration() { touch "$PI_1_MARKER"; }
 		export VIBES_UPDATE_CONTINUED=1 VIBES_UPDATE_PREVIOUS=$(mktemp -d) VIBES_UPDATE_RESULTS=$'packages\tok\t\n'
 		cmd_update
 	) >/dev/null 2>&1
 	node -e "const s=require(process.argv[1]); console.log(s.steps.map(x=>x.name).join(' '))" "$scratch/migration-status.json"
 }
-check "first 1.0 update: baseline before Pi moves, migration after the startup check" '[ "$(migration_update)" = "packages rolling-packages settings mcp-before pi hotfix-job refresh-job startup pi-1-migration telemetry usage-telemetry" ]'
-check "verified laptop: no migration steps" '[ "$(migration_update)" = "packages rolling-packages settings pi hotfix-job refresh-job startup telemetry usage-telemetry" ]'
+check "first 1.0 update: baseline before Pi moves, migration after the startup check" '[ "$(migration_update)" = "packages rolling-packages surf settings mcp-before pi hotfix-job refresh-job startup pi-1-migration telemetry usage-telemetry" ]'
+check "verified laptop: no migration steps" '[ "$(migration_update)" = "packages rolling-packages surf settings pi hotfix-job refresh-job startup telemetry usage-telemetry" ]'
 
 # Upload-only failures keep the installation successful, but retain a nonzero command exit.
 printf '#!/bin/bash\nexit 1\n' >"$scratch/migration/scripts/usage-telemetry"
@@ -132,6 +132,7 @@ pending_update() {
 		source scripts/vibes
 		VIBES=$scratch/migration LOG_FILE=$scratch/pending-log STATUS_FILE=$PI_CODING_AGENT_DIR/vibes-update.json NOTES_FILE=$scratch/pending-notes VIBES_UPDATE_LOCKED=1
 		for f in load_nvm refresh_rolling_packages sync_settings install_pinned_pi install_hotfix_job install_refresh_job update_repo; do eval "$f() { :; }"; done
+		update_surf() { return "$surf_code"; }
 		pi_1_migration_needed() { return 1; }
 		cmd_check() { printf '{}\n' >"$INVENTORY"; return "$startup_code"; }
 		osascript() { echo notification >>"$scratch/notifications"; }
@@ -139,6 +140,7 @@ pending_update() {
 		cmd_update
 	) >"$scratch/pending-output" 2>&1
 }
+surf_code=0
 startup_code=0
 pending_update
 check "upload failure: command still fails" '[ $? -eq 1 ]'
@@ -148,6 +150,10 @@ startup_code=1
 pending_update
 check "mixed failure: command fails" '[ $? -eq 1 ]'
 check "mixed failure: installation failed, notification retained" 'node -e "process.exit(require(process.argv[1]).ok ? 1 : 0)" "$PI_CODING_AGENT_DIR/vibes-update.json" && [ -s "$scratch/notifications" ]'
+
+startup_code=0 surf_code=1
+pending_update
+check "Surf failure: update fails even when Pi starts cleanly" 'node -e "const s=require(process.argv[1]); process.exit(!s.ok && s.steps.some(x=>x.name===\"surf\" && !x.ok) ? 0 : 1)" "$PI_CODING_AGENT_DIR/vibes-update.json"'
 
 # Without nvm, Node can't be kept at the team's version: those steps fail rather than pass.
 (NVM_DIR=$scratch/no-nvm; unset -f nvm; update_nvm >/dev/null)

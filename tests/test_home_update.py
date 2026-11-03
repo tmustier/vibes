@@ -75,6 +75,10 @@ nvm() {
         (seed / "scripts/sync-settings.mjs").write_text(
             'import { writeFileSync } from "node:fs";\n'
             'writeFileSync(process.argv[4] + "/sync-proof", "ok");\n')
+        # The real script needs Surf installed; this one records that it ran and leaves a note.
+        (seed / "scripts/surf-runtime.mjs").write_text(
+            'import { appendFileSync } from "node:fs";\n'
+            'appendFileSync(process.env.PI_CODING_AGENT_DIR + "/vibes-update-notes", "Surf was updated.\\n");\n')
         for name in (".node-version", "package.json", "settings.template.json", "subagent-config.template.json", "web-search.template.json"):
             shutil.copy2(ROOT / name, seed / name)
         self.git(seed, "init", "-q", "-b", "main")
@@ -108,6 +112,10 @@ nvm() {
         self.assertNotIn("agentsTemplateHash", status)
         self.assertEqual(self.file.stat().st_mode & 0o777, 0o600)
         self.assertEqual((self.agent / "sync-proof").read_text(), "ok")
+        names = [step["name"] for step in status["steps"]]
+        self.assertLess(names.index("packages"), names.index("surf"))
+        self.assertEqual(status["notes"], ["Surf was updated."])
+        self.assertFalse((self.agent / "vibes-update-notes").exists())
         self.assertEqual(self.git(self.repo, "status", "--porcelain"), "")
         cli = subprocess.run(["bash", str(self.repo / "scripts/home-vibes"), "status"],
                              env=self.env | {"PATH": str(self.bin) + os.pathsep + os.environ["PATH"]},

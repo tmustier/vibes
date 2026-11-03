@@ -95,7 +95,7 @@ try {
 		VIBES=$2 STATUS_FILE=$3/status.json NOTES_FILE=$3/notes LOG_FILE=$3/log PI_1_MARKER=$3/pi-1-verified.json
 		printf '{"version":"1.0.0"}\n' >"$PI_1_MARKER"
 		VIBES_UPDATE_LOCKED=1 VIBES_UPDATE_CONTINUED=1 VIBES_UPDATE_PREVIOUS=$4 VIBES_UPDATE_RESULTS=$'packages\\tok\\t'
-		for f in load_nvm sync_settings install_pinned_pi install_hotfix_job install_refresh_job update_repo cmd_check osascript; do eval "$f() { :; }"; done
+		for f in load_nvm update_surf sync_settings install_pinned_pi install_hotfix_job install_refresh_job update_repo cmd_check osascript; do eval "$f() { :; }"; done
 		mkdir -p "$VIBES/scripts"
 		printf '#!/bin/bash\\nexit 0\\n' >"$VIBES/scripts/inventory"
 		chmod +x "$VIBES/scripts/inventory"
