@@ -43,6 +43,7 @@ SUITES = {
         "bash tests/test_update_repo.sh",
         "node tests/test_pi_1_migration.mjs",
         "node tests/test_rolling_packages.mjs",
+        "node tests/test_surf_runtime.mjs",
     ],
     "macos": [
         "bash tests/test_vibes_check.sh",

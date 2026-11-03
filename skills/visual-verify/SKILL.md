@@ -21,7 +21,9 @@ Does NOT apply to: backend logic, config files, scripts, tests, markdown, AGENTS
 
 ## Capture
 
-Load the `surf` skill, then create one unfocused Chrome window for this verification and record the returned window and tab IDs as `WIN` and `TAB`:
+First check `command -v surf` and `surf --version` against Vibes' `surf-cli` pin in `package.json`. If Surf is missing, use the separate `browser` tool (or the project's existing browser tests) to render, screenshot and inspect the same states; `/onboard` / `vibes surf-setup` installs Surf when the user's Chrome session is needed. Do not keep retrying Surf or assume `/tmp/surf.sock` exists. If versions differ, run `vibes update`. If commands are unknown or fail with `extension_identity_missing`, reload Surf at `chrome://extensions` with Computer Use. For a disconnected installation, use `surf doctor`; see [Surf setup and local checks](../../docs/existing-setups.md#surf-commands-are-unknown-or-surf-is-missing). Never fall back to the user's active tab.
+
+With a matching, connected runtime, load the `surf` skill, then create one unfocused Chrome window for this verification and record the returned window and tab IDs as `WIN` and `TAB`:
 
 ```bash
 surf window.new "<url>" --unfocused

@@ -47,7 +47,7 @@ cp "$VIBES/scripts/inventory" "$VIBES/scripts/usage-telemetry"
 cp scripts/refresh "$VIBES/scripts/refresh"
 STATUS_FILE=$scratch/status NOTES_FILE=$scratch/notes LOG_FILE=$scratch/log
 VIBES_UPDATE_LOCKED=1 VIBES_UPDATE_CONTINUED=1 VIBES_UPDATE_PREVIOUS=$scratch/previous VIBES_UPDATE_RESULTS=$'packages\tok\t'
-for f in load_nvm refresh_rolling_packages sync_settings install_hotfix_job install_refresh_job update_repo cmd_check osascript; do eval "$f() { :; }"; done
+for f in load_nvm refresh_rolling_packages update_surf sync_settings install_hotfix_job install_refresh_job update_repo cmd_check osascript; do eval "$f() { :; }"; done
 cmd_update >/dev/null
 expect install -g --prefix "$scratch/prefix" --before "$cutoff" @earendil-works/pi-coding-agent@1.2.0
 

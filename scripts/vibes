@@ -9,7 +9,10 @@
 #                  update, a real Pi agent verifies MCP migration and repairs login if needed.
 #   vibes check [dir]
 #                  Start Pi in a hidden tmux session in dir (default: an empty folder) and report the startup
-#                  problems Pi shows: skill, prompt and theme conflicts, extension issues, load errors.
+#                  problems Pi shows, plus mismatched Surf runtime files/host registration.
+#   vibes surf-setup [extension-id]
+#                  Install the pinned Surf runtime; after loading its unpacked Chrome extension,
+#                  pass its ID to register the native host. Shares the update lock.
 #   vibes inventory
 #                  Print the setup inventory exactly as `vibes update` sends it: what Pi loads and what is
 #                  switched on, the context breakdown, and the text of the user's own skills, prompts and
@@ -141,6 +144,9 @@ update_vibes_packages() {
 refresh_rolling_packages() {
 	(cd "$VIBES" && npm install --no-save --omit=dev codex-computer-use-mcp@latest @tmustier/pi-session-hud@latest)
 }
+
+update_surf() { node "$VIBES/scripts/surf-runtime.mjs" update; }
+check_surf() { node "$VIBES/scripts/surf-runtime.mjs" check; }
 
 pinned_pi() { node -p "require('$VIBES/package.json').devDependencies['@earendil-works/pi-coding-agent']"; }
 
@@ -301,6 +307,7 @@ cmd_hotfix_check() {
 	[ ! -f "$VIBES/models.template.json" ] || cp "$VIBES/models.template.json" "$previous/"
 	step packages update_vibes_packages
 	step rolling-packages refresh_rolling_packages
+	step surf update_surf
 	step settings sync_settings "$previous"
 	rm -rf "$previous"
 	! pi_1_migration_needed || step mcp-before capture_pi_1_baseline
@@ -668,8 +675,9 @@ check_gog_keyring() {
 }
 
 cmd_check() {
-	local dir=$1 scratch screen="" previous="" stable=0 problems
+	local dir=$1 scratch screen="" previous="" stable=0 problems surf_status=0
 	check_gog_keyring
+	check_surf || surf_status=$?
 	command -v tmux >/dev/null || { echo "vibes check needs tmux: brew install tmux"; return 1; }
 	scratch=$(mktemp -d)
 	# With no folder, start in an empty one: that checks the global setup on its own. A folder's own
@@ -725,7 +733,7 @@ $problems}"
 	fi
 	if [ -z "$problems" ]; then
 		echo "Pi started cleanly in $dir."
-		return 0
+		return "$surf_status"
 	fi
 	echo "Pi reported startup problems in $dir:"
 	echo "$problems"
@@ -825,6 +833,7 @@ cmd_update() {
 	while IFS= read -r row; do [ -z "$row" ] || RESULTS+=("$row"); done <<<"$VIBES_UPDATE_RESULTS"
 	unset VIBES_UPDATE_RESULTS VIBES_UPDATE_PREVIOUS
 	step rolling-packages refresh_rolling_packages
+	step surf update_surf
 	step settings sync_settings "$previous"
 	rm -rf "$previous"
 	! pi_1_migration_needed || step mcp-before capture_pi_1_baseline
@@ -889,6 +898,7 @@ main() {
 	status) cmd_status ;;
 	features) shift; node "$VIBES/scripts/features.mjs" "$@" ;;
 	check) cmd_check "${2:-}" ;;
+	surf-setup) shift; mkdir -p "$(dirname "$LOCK_FILE")" && with_lock node "$VIBES/scripts/surf-runtime.mjs" setup "$@" ;;
 	hotfix) cmd_hotfix "${2:-}" ;;
 	hotfix-check) cmd_hotfix_check ;;
 	report) "$VIBES/scripts/inventory" "$@" ;;
@@ -898,7 +908,7 @@ main() {
 		cmd_check >&2 && "$VIBES/scripts/inventory" show "$INVENTORY"
 	) ;;
 	*)
-		echo "usage: vibes update | vibes refresh | vibes usage [collect|send] | vibes check [dir] | vibes inventory | vibes status | vibes features [migrate [--apply] [--source <source>]] | vibes report <session.jsonl> <summary> | vibes hotfix <what it fixes> | vibes hotfix-check"
+		echo "usage: vibes update | vibes refresh | vibes usage [collect|send] | vibes check [dir] | vibes surf-setup [extension-id] | vibes inventory | vibes status | vibes features [migrate [--apply] [--source <source>]] | vibes report <session.jsonl> <summary> | vibes hotfix <what it fixes> | vibes hotfix-check"
 		return 2
 		;;
 	esac

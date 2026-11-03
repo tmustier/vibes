@@ -22,7 +22,7 @@ finish() {
   set +e
   [ -z "$previous" ] || rm -rf "$previous"
   if [ "$result" -ne 0 ]; then record "${current_step:-update}" fail "exit $result"; fi
-  python3 - "$STATUS_FILE" "$LOG_FILE" "$result" ${RESULTS[@]+"${RESULTS[@]}"} <<'PY'
+  python3 - "$STATUS_FILE" "$NOTES_FILE" "$LOG_FILE" "$result" ${RESULTS[@]+"${RESULTS[@]}"} <<'PY'
 from datetime import datetime, timezone
 import json
 import os
@@ -30,19 +30,22 @@ from pathlib import Path
 import sys
 import tempfile
 
-file, log, result, *rows = sys.argv[1:]
+file, notes_file, log, result, *rows = sys.argv[1:]
 steps = []
 for row in rows:
     name, state, detail = row.split("\t", 2)
     steps.append({"name": name, "ok": state == "ok", "detail": detail})
+notes_path = Path(notes_file)
+notes = notes_path.read_text().split("\n") if notes_path.is_file() else []
 status = {"updater": "home", "finishedAt": datetime.now(timezone.utc).isoformat(),
-          "ok": result == "0", "log": log, "steps": steps}
+          "ok": result == "0", "log": log, "steps": steps, "notes": [note for note in notes if note]}
 path = Path(file)
 fd, temporary = tempfile.mkstemp(prefix=path.name + ".", dir=path.parent)
 try:
     with os.fdopen(fd, "w") as output:
         output.write(json.dumps(status, indent=2) + "\n")
     os.replace(temporary, path)
+    notes_path.unlink(missing_ok=True)
 finally:
     if os.path.exists(temporary):
         os.unlink(temporary)
@@ -99,6 +102,7 @@ run_step fetch git -C "$repo" fetch --quiet origin main
 run_step merge git -C "$repo" merge --ff-only origin/main
 run_step node update_node
 run_step packages packages
+run_step surf node "$repo/scripts/surf-runtime.mjs" update
 run_step settings node "$repo/scripts/sync-settings.mjs" "$previous" "$repo" "$AGENT_DIR"
 run_step pi install_pi
 run_step startup "$repo/scripts/vibes" check
