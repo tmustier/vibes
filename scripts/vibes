@@ -642,7 +642,7 @@ startup_problems() {
 			block = ""; kept = ""; other = 0
 		}
 		function path(line) { sub(/^ *[✓✗] (auto \([a-z]+\) )?/, "", line); sub(/ \(skipped\)$/, "", line); sub(/^~/, home, line); return line }
-		/^\[(Skill conflicts|Prompt conflicts|Theme conflicts|Extension issues)\]/ { flush(); section = 1; next }
+		/^\[(Skill conflicts|Skill warnings|Prompt conflicts|Theme conflicts|Extension issues)\]/ { flush(); section = 1; next }
 		section && /^$/ { flush(); section = 0; next }
 		section && /^  [^ ]/ { flush() }
 		section && /^ *✓ / { kept = path($0) }
