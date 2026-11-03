@@ -2,7 +2,10 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { feature } from "../lib/feature.ts";
-/** /wut explains recent activity without interrupting the agent. /wut auto on|off toggles its watchdog. */
+/**
+ * /wut explains recent activity without interrupting the agent. /wut auto on|off toggles its watchdog,
+ * which prods a looping agent and interrupts a tool call the agent is pointlessly blocked on.
+ */
 
 import { uuidv7, type AssistantMessage, type Message } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -33,20 +36,31 @@ const MAX_SHOWN_EXCHANGES = 3;
 const OVERLAY_HEIGHT_FRACTION = 0.85;
 const SCROLL_STEP = 5;
 
-// Watchdog (auto-wut) tuning.
-const WATCHDOG_MIN_RUN_MS = 15 * 60_000; // agent must have worked this long since the user's last message
-const WATCHDOG_TICK_MS = 30_000;
-const WATCHDOG_CHECK_INTERVAL_MS = 3 * 60_000; // min gap between observer checks
+// Watchdog (auto-wut). Each action has its own rules; checks run when either could fire.
+// Prod a looping agent: after minRunMs on the user's message and WATCHDOG_MIN_EVENTS tool calls since
+//   the last check; at most WATCHDOG_MAX_PRODS per message, prodCooldownMs after the last prod,
+//   interrupt or warning.
+// Interrupt a hung call: once it has blocked the agent for longToolMs; once per message, never delayed
+//   by a prod.
+export const WATCHDOG_TIMING = {
+	minRunMs: 15 * 60_000,
+	tickMs: 30_000,
+	checkIntervalMs: 3 * 60_000, // min gap between observer checks
+	longToolMs: 10 * 60_000,
+	prodCooldownMs: 10 * 60_000,
+};
+export type WatchdogTiming = typeof WATCHDOG_TIMING;
 const WATCHDOG_MIN_EVENTS = 3; // min tool events since last check
-const WATCHDOG_LONG_TOOL_MS = 10 * 60_000; // …or a single tool running this long
-const WATCHDOG_PROD_COOLDOWN_MS = 10 * 60_000;
 const WATCHDOG_MAX_PRODS = 2; // per real user message
 const WATCHDOG_PROD_PREFIX = "<wut_watchdog>";
+const WATCHDOG_INTERRUPT_MARK = `${WATCHDOG_PROD_PREFIX} wut interrupted`;
 const WATCHDOG_QUESTION = [
 	"This is an automatic check, not the user asking.",
 	"Judge whether the agent is genuinely stuck: repeating near-identical commands or edits, hitting the same error again and again, undoing and redoing the same change, or looping without getting closer to the goal.",
-	"Slow, methodical progress is NOT stuck. A long-running build, test, or download is NOT stuck. Be conservative: only call it stuck with clear repeated evidence.",
-	"If clearly stuck, reply exactly: STUCK: <one short sentence - what it keeps repeating and one concrete suggestion>",
+	"Also judge any tool call listed as running right now. The agent can do nothing else until it returns. It is hung if it is waiting on something that will not happen, sleeping or polling far longer than the task needs, or has stalled with no sign of finishing.",
+	"Slow, methodical progress is NOT stuck. A long-running build, test, or download that is still making progress is NOT hung. Never call a tool hung if stopping it could leave work half-done: a push, deploy, migration, message send, or anything else that changes state. Be conservative: only call it stuck or hung with clear evidence.",
+	"If a running tool call is clearly hung, reply exactly: HUNG: <one short sentence - why waiting on it is pointless and one concrete suggestion>",
+	"Otherwise, if the agent is clearly stuck, reply exactly: STUCK: <one short sentence - what it keeps repeating and one concrete suggestion>",
 	"Otherwise reply exactly: OK",
 ].join("\n");
 
@@ -74,7 +88,13 @@ const blockText = (content: Message["content"], type: "text" | "thinking" = "tex
 interface LiveState {
 	partialText: string;
 	partialThinking: string;
-	running: Map<string, { desc: string; startedAt: number }>;
+	running: Map<string, RunningTool>;
+}
+
+interface RunningTool {
+	desc: string;
+	startedAt: number;
+	output?: { at: number; text: string };
 }
 
 const SYNTHETIC_USER_PREFIXES = ["<pi_goal_continuation ", WATCHDOG_PROD_PREFIX];
@@ -123,9 +143,11 @@ const buildTranscript = (ctx: ExtensionContext, live: LiveState, lastRealInputAt
 			// Only synthetic nudges can appear here (real ones are the anchor).
 			const text = blockText(msg.content, "text").trimStart();
 			sections.push(
-				text.startsWith(WATCHDOG_PROD_PREFIX)
-					? "(watchdog prod: the agent was warned it might be going in circles and told to reassess)"
-					: "(automatic nudge: the agent was told to keep working toward its active long-running goal)",
+				text.startsWith(WATCHDOG_INTERRUPT_MARK)
+					? "(watchdog interrupt: the agent's blocking tool call was stopped because it looked hung, and the agent was told to reassess)"
+					: text.startsWith(WATCHDOG_PROD_PREFIX)
+						? "(watchdog prod: the agent was warned it might be going in circles and told to reassess)"
+						: "(automatic nudge: the agent was told to keep working toward its active long-running goal)",
 			);
 		}
 	}
@@ -143,7 +165,14 @@ const buildTranscript = (ctx: ExtensionContext, live: LiveState, lastRealInputAt
 	// Live, in-flight state (not yet in the session).
 	const liveLines: string[] = [];
 	if (live.running.size > 0) {
-		liveLines.push(`Tools running right now:\n${[...live.running.values()].map((t) => t.desc).join("\n")}`);
+		const now = Date.now();
+		const minutes = (ms: number) => `${Math.round(ms / 6_000) / 10} min`;
+		const tools = [...live.running.values()].map((tool) => {
+			const quiet = tool.output ? `last output ${minutes(now - tool.output.at)} ago` : "no output yet";
+			const output = tool.output?.text ? `\nLatest output:\n${tool.output.text}` : "";
+			return `${tool.desc}\n(running for ${minutes(now - tool.startedAt)}, ${quiet})${output}`;
+		});
+		liveLines.push(`Tools running right now (the agent is blocked until they return):\n${tools.join("\n\n")}`);
 	}
 	const partial = (live.partialText || live.partialThinking).trim();
 	if (partial) {
@@ -234,41 +263,50 @@ const askObserver = async (
 	}
 };
 
-export default feature(import.meta.url, (pi: ExtensionAPI) => {
+/** Build the extension; tests pass shorter watchdog timings. */
+export const createWut = (timing: WatchdogTiming = WATCHDOG_TIMING) => (pi: ExtensionAPI) => {
 	const live: LiveState = { partialText: "", partialThinking: "", running: new Map() };
-	let lastRealInputAt: number | undefined;
+	// The watchdog's budget for the user's latest message; unset until the user speaks.
+	let task: { startedAt: number; prods: number; interrupted: boolean; lastActionAt: number } | undefined;
 
 	let watchdogEnabled = true;
 	let watchdogTimer: ReturnType<typeof setInterval> | undefined;
 	let watchdogRequest: AbortController | undefined;
 	let lastCheckAt = 0;
 	let toolEventsSinceCheck = 0;
-	let lastStuckActionAt = 0;
-	let prodsSinceRealInput = 0;
+	// Keep prods out of Pi's queue: abort would move a queued steer into the user's editor.
+	let pending: { kind: "prod" | "interrupt"; text: string } | undefined;
+
+	const blockingTools = (now: number) =>
+		[...live.running.values()].filter((tool) => now - tool.startedAt > timing.longToolMs);
 
 	const stopWatching = () => {
 		clearInterval(watchdogTimer);
 		watchdogTimer = undefined;
 		watchdogRequest?.abort();
+		pending = undefined;
 		live.partialText = "";
 		live.partialThinking = "";
 		live.running.clear();
 	};
 	pi.on("session_shutdown", stopWatching);
-	pi.on("agent_settled", stopWatching);
+	pi.on("agent_settled", () => {
+		const note = pending;
+		stopWatching();
+		// Pi defers a prompt sent while settling until the session is idle.
+		if (note?.kind === "interrupt") pi.sendUserMessage(note.text);
+	});
 	pi.on("session_start", () => {
 		stopWatching();
-		lastRealInputAt = undefined;
-		lastStuckActionAt = 0;
-		prodsSinceRealInput = 0;
+		task = undefined;
 	});
 
 	// /wut skips the input event, so opening it never moves the anchor.
 	pi.on("input", (event) => {
 		if (event.source === "extension") return;
 		watchdogRequest?.abort();
-		lastRealInputAt = Date.now();
-		prodsSinceRealInput = 0;
+		pending = undefined;
+		task = { startedAt: Date.now(), prods: 0, interrupted: false, lastActionAt: 0 };
 	});
 
 	pi.on("agent_start", (_event, ctx) => {
@@ -278,35 +316,59 @@ export default feature(import.meta.url, (pi: ExtensionAPI) => {
 		watchdogTimer = setInterval(async () => {
 			if (!watchdogEnabled || watchdogRequest || ctx.isIdle()) return;
 			const now = Date.now();
-			if (lastRealInputAt === undefined || now - lastRealInputAt < WATCHDOG_MIN_RUN_MS) return;
-			if (now - lastCheckAt < WATCHDOG_CHECK_INTERVAL_MS) return;
-			const longTool = [...live.running.values()].some((tool) => now - tool.startedAt > WATCHDOG_LONG_TOOL_MS);
-			if (toolEventsSinceCheck < WATCHDOG_MIN_EVENTS && !longTool) return;
+			// A new user message aborts this request, so the task cannot change under it.
+			const current = task;
+			if (!current || now - lastCheckAt < timing.checkIntervalMs) return;
+			const mayProd = now - current.startedAt >= timing.minRunMs && toolEventsSinceCheck >= WATCHDOG_MIN_EVENTS;
+			if (!mayProd && blockingTools(now).length === 0) return;
 			const request = new AbortController();
 			watchdogRequest = request;
 			try {
 				const response = await askObserver(
 					ctx,
-					[makeUserMessage(firstPrompt(buildTranscript(ctx, live, lastRealInputAt), WATCHDOG_QUESTION))],
+					[makeUserMessage(firstPrompt(buildTranscript(ctx, live, current.startedAt), WATCHDOG_QUESTION))],
 					uuidv7(),
 					request.signal,
 				);
-				const answer = blockText(response.content).trim();
-				if (request.signal.aborted || ctx.isIdle() || !/^STUCK\b/i.test(answer)) return;
-				if (Date.now() - lastStuckActionAt < WATCHDOG_PROD_COOLDOWN_MS) return;
-				const reason = answer.replace(/^STUCK[:\s]*/i, "").trim() || "repeating the same actions without progress";
-				lastStuckActionAt = Date.now();
-				if (prodsSinceRealInput >= WATCHDOG_MAX_PRODS) {
-					if (ctx.hasUI)
-						ctx.ui.notify(`wut: agent still looks stuck (${reason}) - not prodding again, take a look`, "warning");
-					return;
+				const verdict = /^(STUCK|HUNG)\b[:\s]*([\s\S]*)/i.exec(blockText(response.content).trim());
+				if (request.signal.aborted || ctx.isIdle() || !verdict) return;
+				const actionAt = Date.now();
+				const coolingDown = actionAt - current.lastActionAt < timing.prodCooldownMs;
+				const hung = verdict[1].toUpperCase() === "HUNG";
+				const reason = verdict[2].trim() || (hung ? "the call looks hung" : "repeating the same actions without progress");
+				// The call may have returned while the observer answered.
+				const blocking = blockingTools(actionAt);
+				const interrupt = hung && blocking.length > 0;
+				if (!interrupt && !mayProd) return;
+				if (coolingDown && (!interrupt || current.interrupted)) return;
+				current.lastActionAt = actionAt;
+
+				let notice: string;
+				if (interrupt && current.interrupted) {
+					notice = `agent looks blocked again (${reason}) - not interrupting again, take a look`;
+				} else if (interrupt) {
+					current.interrupted = true;
+					const minutes = Math.round((actionAt - Math.min(...blocking.map((tool) => tool.startedAt))) / 60_000);
+					pending = {
+						kind: "interrupt",
+						text: `${WATCHDOG_INTERRUPT_MARK} you: you had been blocked for ${minutes} min on:\n${blocking.map((tool) => tool.desc).join("\n")}\nObserver: ${reason}\nThe call was stopped. Check the state it left behind, then choose a new approach: retry with a timeout, run it in the background, or change course toward the user's goal.`,
+					};
+					ctx.abort();
+					notice = `interrupted the agent's blocked tool call - ${reason}`;
+				} else if (current.prods === WATCHDOG_MAX_PRODS) {
+					notice = `agent still looks stuck (${reason}) - not prodding again, take a look`;
+				} else {
+					current.prods++;
+					const prod = `${WATCHDOG_PROD_PREFIX} A friendly observer agent thinks you may be going in circles. It said: ${reason}\nPause, consider the user's intent, and consider whether you should take a step back and change approach, fix the source of current friction directly to enable progress, or stay the course. Then proceed with your chosen course of action.`;
+					if (blocking.length > 0) {
+						pending = { kind: "prod", text: prod };
+						notice = `will prod the agent when its current tool call returns - ${reason}`;
+					} else {
+						pi.sendUserMessage(prod, { deliverAs: "steer" });
+						notice = `prodded the agent - ${reason}`;
+					}
 				}
-				prodsSinceRealInput++;
-				pi.sendUserMessage(
-					`${WATCHDOG_PROD_PREFIX} A friendly observer agent thinks you may be going in circles. It said: ${reason}\nPause, consider the user's intent, and consider whether you should take a step back and change approach, fix the source of current friction directly to enable progress, or stay the course. Then proceed with your chosen course of action.`,
-					{ deliverAs: "steer" },
-				);
-				if (ctx.hasUI) ctx.ui.notify(`wut: prodded the agent - ${reason}`, "warning");
+				if (ctx.hasUI) ctx.ui.notify(`wut: ${notice}`, "warning");
 			} catch {
 				// A failed background observation must not interrupt the agent.
 			} finally {
@@ -314,36 +376,47 @@ export default feature(import.meta.url, (pi: ExtensionAPI) => {
 				lastCheckAt = Date.now();
 				toolEventsSinceCheck = 0;
 			}
-		}, WATCHDOG_TICK_MS);
+		}, timing.tickMs);
 		watchdogTimer.unref();
 	});
 
-	pi.on("message_update", async (event) => {
+	pi.on("message_update", (event) => {
 		if (event.message.role !== "assistant") return;
 		live.partialText = blockText(event.message.content, "text");
 		live.partialThinking = blockText(event.message.content, "thinking");
 	});
 
-	pi.on("message_end", async (event) => {
+	pi.on("message_end", (event) => {
 		if (event.message.role !== "assistant") return;
 		live.partialText = "";
 		live.partialThinking = "";
 	});
 
-	pi.on("tool_execution_start", async (event) => {
+	pi.on("tool_execution_start", (event) => {
 		live.running.set(event.toolCallId, {
 			desc: `${event.toolName}: ${clip(JSON.stringify(event.args), MAX_TOOL_ARG_CHARS)}`,
 			startedAt: Date.now(),
 		});
 	});
 
-	pi.on("tool_execution_end", async (event) => {
+	pi.on("tool_execution_update", (event) => {
+		const tool = live.running.get(event.toolCallId);
+		if (!tool) return;
+		tool.output = { at: Date.now(), text: blockText(event.partialResult.content).trim().slice(-MAX_TOOL_RESULT_CHARS) };
+	});
+
+	pi.on("tool_execution_end", (event) => {
 		live.running.delete(event.toolCallId);
 		toolEventsSinceCheck++;
+		if (pending?.kind === "prod" && live.running.size === 0) {
+			pi.sendUserMessage(pending.text, { deliverAs: "steer" });
+			pending = undefined;
+		}
 	});
 
 	pi.registerCommand("wut", {
-		description: "Plain-language update on what the agent is doing; '/wut auto on|off' toggles the stuck-watchdog",
+		description:
+			"Plain-language update on what the agent is doing; '/wut auto on|off' toggles the watchdog that prods a stuck agent and interrupts a hung tool call",
 		handler: async (args, ctx) => {
 			const trimmed = args.trim();
 			if (/^auto\b/i.test(trimmed)) {
@@ -352,9 +425,10 @@ export default feature(import.meta.url, (pi: ExtensionAPI) => {
 				else if (arg === "off") {
 					watchdogEnabled = false;
 					watchdogRequest?.abort();
+					pending = undefined;
 				}
 				const status = watchdogEnabled
-					? `wut watchdog ON - checks every ${WATCHDOG_CHECK_INTERVAL_MS / 60_000} min while the agent works, prods it (max ${WATCHDOG_MAX_PRODS} per task) when it looks stuck`
+					? `wut watchdog ON - checks every ${timing.checkIntervalMs / 60_000} min while the agent works, prods it (max ${WATCHDOG_MAX_PRODS} per task) when it looks stuck, and interrupts a tool call that has blocked it for ${timing.longToolMs / 60_000}+ min and looks hung (max one per task)`
 					: "wut watchdog OFF";
 				if (ctx.hasUI) ctx.ui.notify(status, "info");
 				else console.log(status);
@@ -366,7 +440,7 @@ export default feature(import.meta.url, (pi: ExtensionAPI) => {
 			if (ctx.mode !== "tui") {
 				const response = await askObserver(
 					ctx,
-					[makeUserMessage(firstPrompt(buildTranscript(ctx, live, lastRealInputAt), initialQuestion))],
+					[makeUserMessage(firstPrompt(buildTranscript(ctx, live, task?.startedAt), initialQuestion))],
 					observerSessionId,
 				);
 				const answer = blockText(response.content) || "(no answer)";
@@ -381,8 +455,10 @@ export default feature(import.meta.url, (pi: ExtensionAPI) => {
 				(tui, theme, _kb, done) => {
 					const exchanges: { question: string; answer: string }[] = [];
 					let convo: Message[] = [];
-					let pending: { question: string; controller: AbortController } | undefined;
-					let error: string | undefined;
+					let status:
+						| { kind: "asking"; question: string; controller: AbortController }
+						| { kind: "failed"; error: string }
+						| { kind: "ready" } = { kind: "ready" };
 					let copied = false;
 					let copyTimer: ReturnType<typeof setTimeout> | undefined;
 					let scrollUp = 0; // lines scrolled up from the bottom (0 = pinned to bottom)
@@ -395,33 +471,32 @@ export default feature(import.meta.url, (pi: ExtensionAPI) => {
 
 					const ask = async (question: string, reset: boolean) => {
 						const controller = new AbortController();
-						pending = { question, controller };
-						error = undefined;
+						status = { kind: "asking", question, controller };
 						scrollUp = 0;
 						if (reset) convo = [];
 						const messages = [
 							...convo,
 							makeUserMessage(
-								convo.length ? question : firstPrompt(buildTranscript(ctx, live, lastRealInputAt), question),
+								convo.length ? question : firstPrompt(buildTranscript(ctx, live, task?.startedAt), question),
 							),
 						];
 						tui.requestRender();
 						try {
 							const response = await askObserver(ctx, messages, observerSessionId, controller.signal);
-							if (controller.signal.aborted) return;
 							convo = [...messages, response];
 							exchanges.push({ question, answer: blockText(response.content) || "(no answer)" });
+							status = { kind: "ready" };
 						} catch (err) {
-							if (!controller.signal.aborted) error = err instanceof Error ? err.message : String(err);
-						} finally {
-							pending = undefined;
-							scrollUp = 0;
-							if (!controller.signal.aborted) tui.requestRender();
+							status = { kind: "failed", error: err instanceof Error ? err.message : String(err) };
 						}
+						// Closing the overlay is the only abort; nothing is left to render.
+						if (controller.signal.aborted) return;
+						scrollUp = 0;
+						tui.requestRender();
 					};
 
 					editor.onSubmit = (value) => {
-						if (pending) return;
+						if (status.kind === "asking") return;
 						const question = value.trim();
 						editor.setText("");
 						void ask(question || DEFAULT_QUESTION, !question);
@@ -434,7 +509,7 @@ export default feature(import.meta.url, (pi: ExtensionAPI) => {
 							const inner = w - 4; // "│ " … " │"
 
 							const content: string[] = [];
-							const shown = exchanges.slice(-(MAX_SHOWN_EXCHANGES - (pending ? 1 : 0)));
+							const shown = exchanges.slice(-(MAX_SHOWN_EXCHANGES - (status.kind === "asking" ? 1 : 0)));
 							if (exchanges.length > shown.length) {
 								content.push(theme.fg("dim", `(${exchanges.length - shown.length} earlier answers hidden)`));
 							}
@@ -442,13 +517,12 @@ export default feature(import.meta.url, (pi: ExtensionAPI) => {
 								content.push("", ...wrapTextWithAnsi(theme.fg("muted", `❯ ${exchange.question}`), inner));
 								content.push(...new Markdown(exchange.answer, 1, 0, mdTheme).render(inner));
 							}
-							if (pending) {
-								content.push("", ...wrapTextWithAnsi(theme.fg("muted", `❯ ${pending.question}`), inner));
+							if (status.kind === "asking") {
+								content.push("", ...wrapTextWithAnsi(theme.fg("muted", `❯ ${status.question}`), inner));
 								content.push("", theme.fg("dim", "thinking…"));
 							}
-							if (error) {
-								content.push("");
-								content.push(...wrapTextWithAnsi(theme.fg("error", `Error: ${error}`), inner));
+							if (status.kind === "failed") {
+								content.push("", ...wrapTextWithAnsi(theme.fg("error", `Error: ${status.error}`), inner));
 							}
 
 							content.push("");
@@ -496,7 +570,7 @@ export default feature(import.meta.url, (pi: ExtensionAPI) => {
 						invalidate: () => editor.invalidate(),
 						dispose: () => {
 							clearTimeout(copyTimer);
-							pending?.controller.abort();
+							if (status.kind === "asking") status.controller.abort();
 						},
 						handleInput: (data: string) => {
 							if (matchesKey(data, Key.escape)) {
@@ -544,4 +618,6 @@ export default feature(import.meta.url, (pi: ExtensionAPI) => {
 			);
 		},
 	});
-});
+};
+
+export default feature(import.meta.url, createWut());
