@@ -20,7 +20,10 @@ for (const id of ["gpt-6.1-sol", "gpt-6-astra"]) {
  assert.ok(template.enabledModels.includes(`openai-codex/${id}:medium`));
  assert.deepEqual(template.compaction.modelOverrides[`openai-codex/${id}`], id === "gpt-6.1-sol" ? { reserveTokens: 50000 } : undefined);
 }
-assert.equal(template.subagents.agentOverridesByProvider["openai-codex"].oracle.model, "anthropic/claude-fable-5-1");
+assert.ok(template.enabledModels.includes("anthropic/claude-fable-5-2:high"));
+assert.deepEqual(template.compaction.modelOverrides["anthropic/claude-fable-5-2"], { reserveTokens: 600000 });
+assert.equal(template.compaction.modelOverrides["anthropic/claude-fable-5-1"], undefined);
+assert.equal(template.subagents.agentOverridesByProvider["openai-codex"].oracle.model, "anthropic/claude-fable-5-2");
 assert.equal(template.subagents.agentOverridesByProvider.anthropic.oracle.model, "openai-codex/gpt-6.1-sol");
 assert.match(readFileSync("prompts/onboard.md", "utf8"), /Do not require an `openai` login/);
 assert.match(readFileSync("scripts/vibes", "utf8"), /local AGENT_MODEL="\$provider\/gpt-6\.1-sol:medium"/);
@@ -54,6 +57,14 @@ try {
    assert.deepEqual(synced.packages, personal.packages);
    assert.deepEqual(run(prev, synced), synced, "repeat sync is idempotent");
   }
+  // Fable upgrades move the model list, compaction key and oracle together on either route.
+  const previousFable = JSON.parse(JSON.stringify(expected).replaceAll("claude-fable-5-2", "claude-fable-5-1"));
+  assert.deepEqual(run(previousFable, previousFable), expected);
+  const customFable = structuredClone(previousFable);
+  customFable.subagents.agentOverridesByProvider[provider].oracle.model = "anthropic/claude-opus-5-5";
+  const expectedCustom = structuredClone(expected);
+  expectedCustom.subagents = customFable.subagents;
+  assert.deepEqual(run(previousFable, customFable), expectedCustom, "personal oracle choice survives the Fable upgrade");
   // Ordinary compaction updates still apply; deliberate overrides survive.
   const prev = structuredClone(expected);
   prev.compaction.modelOverrides[`${provider}/gpt-6.1-sol`] = { reserveTokens: 22000 };

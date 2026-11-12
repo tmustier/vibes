@@ -86,6 +86,8 @@ The same extension loads twice, but not through a package entry in `settings.jso
 
 `vibes update` and actual hotfix installs now upgrade existing global npm Surf copies found on PATH or in the registered host wrapper to the exact `package.json` pin, in their original prefixes. The extension's `dist/` files update in place. The stock native host is re-registered with the active CLI's host and current Node explicitly, rather than upstream's preference for another npm global root or Homebrew Node. Existing extension IDs and manifest fields survive; changed registration files get adjacent `.vibes-backup-<time>` copies. Failures are recorded as the `surf` update step. Nightly handover uses the new script immediately; a hotfix applied by an older script gains this step on its next nightly update.
 
+Surf 2.26 adds a manifest key, so Chrome assigns the same extension ID (`oaclimdkkglbnpekeignmjenkodkaaka`) to every unpacked install after reload. Vibes authorizes that ID in each existing managed browser's native-host manifest, preserving old IDs and other fields with backups. `vibes check` detects missing authorization even when the versions and wrapper already match. Registration uses the upstream native-host helpers without linking another copy of the agent skill.
+
 **Chrome keeps the old extension until Surf is reloaded.** Until then Surf keeps working on its old code; after Chrome next restarts, every command fails with `extension_identity_missing`, and restarting again does not help (tested on a real Chrome on 3 Nov 2026). Clicking Reload on Surf at `chrome://extensions` fixes it. Vibes' Surf wrapper adds that instruction to any tool result reporting `extension_identity_missing` or `Unknown tool: session.…`, so Pi reloads the extension itself with Computer Use and asks the user only if it cannot reach Chrome. The update note says the same. Vibes does not edit Chrome profile preferences or restart Chrome, and a disk version does not prove what Chrome has loaded. `vibes check` fails on installed-version or host-registration mismatches while still reporting Pi startup problems; a missing runtime or unfinished browser setup is reported with setup instructions, not a Pi startup failure.
 
 For a fresh installation, run `vibes surf-setup`, load the printed path unpacked in Chrome following the pinned package's `node_modules/surf-cli/README.md`, then run `vibes surf-setup <extension-id>` with the ID Chrome shows. Ensure `~/.local/bin` is on PATH. Fresh installs use `~/.local` for a stable extension path across Node upgrades (# agent-default (not a user rule): 2026-11-03). An update never installs an absent runtime. Until setup finishes, use the separate `browser` tool or the project's browser tests for visual verification; neither needs Surf's socket. Do not import cookies without approval.
@@ -208,6 +210,14 @@ If an earlier fix exists only on a local branch, your installed Vibes copy will 
 
 Follow the startup checks below. A login, model-picker entry or restored session label is not proof of a working request.
 
+## Fable 5.2 rejects the Claude client version
+
+Fable 5.2 can appear in the model picker after `pi update --models` but fail with `claude_code_version_too_old`. Pi 1.5.0 sends `claude-cli/2.1.280`, while Anthropic requires 2.1.290 or newer for Fable 5.2.
+
+Pi 1.5.2 fixes the client header, and Vibes pins that version. The Fable 5.2 model definition comes from the official registry, without a Vibes header override. Run `vibes update`, restart Pi and verify a model request with a tool call, not just the model list. After confirming the installed Pi is 1.5.2 or newer, remove any personal Fable 5.2 `headers.user-agent` workaround. Keep unrelated model settings.
+
+The Fable compaction override sets `reserveTokens: 600000`. With the model's 1M context window, Pi starts compaction above 400K projected context tokens. The override controls when compaction starts, not which model writes the summary.
+
 ## Sol still shows a 272K context window
 
 Pi 1.1.0's catalogue still lists `openai-codex/gpt-6.1-sol` at 272K after Codex raised its default to 500K. Vibes syncs `models.template.json` into the matching fields in personal `models.json`, preserving unrelated provider settings and deliberate model overrides. Restart Pi after updating and check `pi --list-models 'gpt-6.1-sol'` for 500K on the Codex route.
@@ -220,7 +230,7 @@ If settings sync reports that it kept a personal `compaction` object, inspect it
 
 With Pi's bundled CLI, a foreground child could leave a provider WebSocket open after its task finished. The child released resources in the SDK's registry but missed the host extension's registry, so `pi -p` could print its answer and never exit.
 
-Pi 1.5.0 is paired with pi-subagents commit `343ba73abeaf0a6e942a906ee4333a35f495b757`, which includes the unreleased [upstream fix (#3141)](https://github.com/nicobailon/pi-subagents/pull/3141). Keep the commit pin until an npm release includes the fix. After updating, run `vibes check` and a real subagent task, and confirm the parent process exits normally.
+Pi 1.5.2 is paired with pi-subagents 0.88.0. The [upstream fix (#3141)](https://github.com/nicobailon/pi-subagents/pull/3141) was released in 0.85.0, so the temporary Git commit pin is no longer needed. After updating, run `vibes check` and a real subagent task, and confirm the parent process exits normally.
 
 ## Pi 1.0 migration on an existing laptop
 
@@ -268,6 +278,12 @@ The home command does not install update, refresh, hotfix or upload jobs. Inspec
 Generic refresh and hotfix utilities remain available for explicit opt-in use under `ai.vibes.*` launchd labels. They are separate from the home updater. Read their behavior before invoking or scheduling them: they may run broader package updates or configured telemetry sends. No automatic jobs are required for a home setup.
 
 Telemetry defaults to `null` (local-only). Choose a private destination explicitly before sending; see [telemetry destinations](telemetry-destinations.md). A connection failure does not establish that credentials are invalid. Inspect the actual error rather than reinstalling packages or removing accounts to hide it.
+
+### ChatGPT native updates
+
+`vibes chatgpt-update` is an explicit opt-in command; the home updater does not run or schedule it. It installs ChatGPT for Work with Homebrew when it is missing, replaces the older ChatGPT app (which has no Computer Use) after a 10-minute warning if it is open, and otherwise stages updates with ChatGPT's native Sparkle updater. Read it before running or scheduling it.
+
+If `vibes chatgpt-update --status` shows `retry-pending`, read the error in `~/Library/Logs/pi-update.log`. Offline, permission, notification and reopen failures do not complete the Saturday deadline. A scheduled job retries every 5 minutes, and gives a new 10-minute warning before restarting an open app after sleep, shutdown or a lost connection. Do not replace an installed ChatGPT with Homebrew. Install the Xcode Command Line Tools if `xcrun clang` is missing. The updater uses the publisher feed packaged in the app; it may not reproduce ChatGPT's internal release-policy choices.
 
 ## Prompt templates that fail to parse
 

@@ -2,6 +2,7 @@
 // Chrome owns the running extension/host: never restart it or claim these checks verify it.
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import { createRequire } from "node:module";
 import os from "node:os";
@@ -34,7 +35,10 @@ function main() {
 	assert(/^\d+\.\d+\.\d+$/.test(pinned), "surf-cli must have an exact version pin");
 	const bundled = path.join(root, "node_modules/surf-cli");
 	assert.equal(json(path.join(bundled, "package.json")).version, pinned, "Bundled Surf differs from the pin; reinstall Vibes dependencies first");
-	const { BROWSERS, HOST_NAME } = createRequire(import.meta.url)(path.join(bundled, "native/doctor.cjs"));
+	const require = createRequire(import.meta.url);
+	const { BROWSERS, HOST_NAME } = require(path.join(bundled, "native/doctor.cjs"));
+	const { SURF_EXTENSION_ID } = require(path.join(bundled, "scripts/install-native-host.cjs"));
+	assert(/^[a-p]{32}$/.test(SURF_EXTENSION_ID), "Bundled Surf does not declare its extension ID");
 	const roots = new Set();
 	const packageRoot = (file, entry) => {
 		const real = fs.realpathSync(file);
@@ -64,7 +68,7 @@ function main() {
 		assert(manifest.path === wrapper, `Custom Surf native host in ${file}; review manually. ${guide}`);
 		assert(manifest.allowed_origins?.length && manifest.allowed_origins.every((origin) => /^chrome-extension:\/\/[a-p]{32}\/$/.test(origin)),
 			`Invalid Surf allowed_origins in ${file}; follow ${guide}`);
-		manifests.push({ browser, file, id: manifest.allowed_origins[0].split("/")[2] });
+		manifests.push({ browser, file, origins: manifest.allowed_origins });
 	}
 	// Recognise only upstream's uncustomised wrapper (2.9.0 and 2.25.0 share this shape).
 	// Never execute shell text to discover its host, nor discard listener/socket customisations.
@@ -111,17 +115,30 @@ function main() {
 		assert.equal(json(path.join(dir, "dist/manifest.json")).version, pinned, `Surf extension files differ at ${dir}`);
 	}
 	if (extensionId && !manifests.some(({ browser }) => browser === "chrome")) {
-		manifests.push({ browser: "chrome", id: extensionId });
+		manifests.push({ browser: "chrome", origins: [] });
 	}
+	let wrapperBackedUp = false;
+	const backup = (file) => fs.copyFileSync(file, `${file}.vibes-backup-${Date.now()}-${randomUUID()}`, fs.constants.COPYFILE_EXCL);
 	for (const manifest of manifests) {
-		if (read(wrapper) === desiredWrapper && !(extensionId && manifest.browser === "chrome")) continue;
-		assert(mode !== "check", `Surf host registration differs from the active CLI/Node; run vibes update. ${guide}`);
+		const ids = [...new Set([SURF_EXTENSION_ID, ...(extensionId && manifest.browser === "chrome" ? [extensionId] : [])])];
+		const authorized = ids.every((id) => manifest.origins.includes(`chrome-extension://${id}/`));
+		if (read(wrapper) === desiredWrapper && authorized) continue;
+		assert(mode !== "check", `Surf host registration differs from the active CLI/Node or extension ID; run vibes update. ${guide}`);
 		notify();
-		if (fs.existsSync(wrapper)) fs.copyFileSync(wrapper, `${wrapper}.vibes-backup-${Date.now()}`);
-		if (manifest.file) fs.copyFileSync(manifest.file, `${manifest.file}.vibes-backup-${Date.now()}`);
-		run(process.execPath, [path.join(active, "scripts/install-native-host.cjs"), extensionId && manifest.browser === "chrome" ? extensionId : manifest.id, "--browser", manifest.browser],
-			{ ...process.env, SURF_NODE_PATH: process.execPath, SURF_HOST_PATH: path.join(active, "native/host.cjs") });
+		if (!wrapperBackedUp && fs.existsSync(wrapper)) {
+			backup(wrapper);
+			wrapperBackedUp = true;
+		}
+		if (manifest.file) backup(manifest.file);
+		// Register only the native host. The installer CLI also links agent skills,
+		// which would duplicate the Surf skill Vibes already manages.
+		const installer = require(path.join(active, "scripts/install-native-host.cjs"));
+		const registeredWrapper = installer.createWrapper(path.dirname(wrapper), process.execPath, path.join(active, "native/host.cjs"));
+		for (const id of ids) installer.installManifest(manifest.browser, id, registeredWrapper, process.platform);
 		assert.equal(read(wrapper), desiredWrapper, "Surf installer did not register the selected host and Node");
+		const registered = json(path.join(os.homedir(), BROWSERS[manifest.browser][process.platform], `${HOST_NAME}.json`));
+		assert(ids.every((id) => registered.allowed_origins.includes(`chrome-extension://${id}/`)), "Surf installer did not authorize the extension ID");
+		assert(manifest.origins.every((origin) => registered.allowed_origins.includes(origin)), "Surf installer removed an existing extension ID");
 	}
 	if (!manifests.length) {
 		console.log(`Surf ${pinned} files are installed, but browser setup is incomplete. Load unpacked ${active}/dist at chrome://extensions, then run vibes surf-setup <extension-id>. Add ${path.resolve(active, "../../../bin")} to PATH if needed.`);

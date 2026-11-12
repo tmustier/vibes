@@ -30,6 +30,8 @@ Your choices live in `~/.pi/agent/vibes.json`:
 
 Run `vibes features` to list feature names and defaults. The initial home profile is not an overwrite policy: later choices stay yours. Dependencies remain installed when their features are off.
 
+An optional skill reviews an internal team meeting from its transcript: your own part, where the conversation got stuck and what was left without a decision or an owner. To use it, add the path of `optional-skills/internal-meeting-review` in your clone to `skills` in `~/.pi/agent/settings.json` and run `/reload`. It reads a transcript file or a Granola meeting.
+
 See [existing setups](docs/existing-setups.md), [fast mode](docs/fast-mode.md) and the package guides for [browser tools](packages/pi-browser/README.md) and [request compression](packages/pi-anthropic-gzip/README.md).
 
 ## Claude artifacts
@@ -37,6 +39,12 @@ See [existing setups](docs/existing-setups.md), [fast mode](docs/fast-mode.md) a
 Ask Pi to publish a page on claude.ai, update an existing artifact, read its comments or use its shared database. The tools load when needed and require Claude Code on `PATH`, signed in with `claude auth login` to an account with artifacts enabled. Without Claude Code, the feature adds nothing.
 
 Set `"claude-artifacts": false` in your feature choices to disable it. See [Claude artifact tools](docs/claude-artifacts.md) for details and limitations, or [existing setups](docs/existing-setups.md#claude-artifact-skill-from-an-older-vibes) if you used the old publishing skill.
+
+## Claude Code subscription
+
+Vibes bundles [pi-claude-code](https://github.com/earendil-works/pi-claude-code). `vibes update` and `/onboard` install Claude Code if it is missing. Run `claude auth login`, check `/claude-code-status` in Pi, then select a model from **Claude Code Subscription (Experimental)**. Your current model selection stays unchanged. Usage counts against your Claude subscription; upstream warns that billing may change.
+
+Set `"claude-code": false` in your feature choices to disable the provider and skip the CLI installation.
 
 ## Idle parking
 
@@ -50,11 +58,11 @@ Open a new terminal and run `pi --help` to check for `--park-after`. `/park` par
 
 ## Updates
 
-`~/.local/bin/vibes` points to `scripts/home-vibes` in your clone. `vibes update` fast-forwards from this repository, installs dependencies, updates unchanged template settings, keeps Pi at the tested version and runs `vibes check`. It does not merge another repository or push commits. A dirty or diverged checkout needs manual review.
+`~/.local/bin/vibes` points to `scripts/home-vibes` in your clone. `vibes update` fast-forwards from this repository, installs dependencies, updates unchanged template settings, keeps Pi at the tested version, refreshes the model registry and runs `vibes check`. It does not merge another repository or push commits. A dirty or diverged checkout needs manual review.
 
 The home updater writes `~/.pi/agent/vibes-update.json` with `updater: "home"`, a success or failure result and step details, plus a personal update log. `vibes status` shows the structured result and launchd state. The update-status extension warns about failed or stale updates and recommends `vibes update`, not managed refresh. Home repairs stay local, create no central report and do not ask you to synchronize an AGENTS template.
 
-`scripts/home-install-job` installs the optional nightly macOS update job. The home command does not run managed refresh or hotfix jobs, update other workspaces or install upload jobs.
+`scripts/home-install-job` installs the optional nightly macOS update job. The home command does not run managed refresh or hotfix jobs, update other workspaces or install upload jobs. `vibes chatgpt-update` is a separate opt-in command for the ChatGPT for Work app that Computer Use needs; see [existing setups](docs/existing-setups.md#chatgpt-native-updates) before running it.
 
 `vibes check` starts Pi in a hidden tmux session. Behaviour changes also need a real prompt and tool call. If Granola times out despite a valid login, see the [compatibility fix](docs/granola-mcp.md).
 

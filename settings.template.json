@@ -3,7 +3,7 @@
     "openai-codex/gpt-6.1-sol:medium",
     "openai-codex/gpt-6-astra:medium",
     "anthropic/claude-opus-5-5:high",
-    "anthropic/claude-fable-5-1:high"
+    "anthropic/claude-fable-5-2:high"
   ],
   "defaultProvider": "openai-codex",
   "defaultModel": "gpt-6.1-sol",
@@ -32,7 +32,7 @@
       "anthropic/claude-opus-5-5": {
         "reserveTokens": 600000
       },
-      "anthropic/claude-fable-5-1": {
+      "anthropic/claude-fable-5-2": {
         "reserveTokens": 600000
       }
     }
@@ -51,7 +51,7 @@
     "agentOverridesByProvider": {
       "openai-codex": {
         "oracle": {
-          "model": "anthropic/claude-fable-5-1",
+          "model": "anthropic/claude-fable-5-2",
           "thinking": "high"
         }
       },

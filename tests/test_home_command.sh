@@ -11,7 +11,7 @@ actual=$("$root/bin/vibes" features)
 [ "$actual" = 'home:features' ] || { echo "Wrong package root: $actual"; exit 1; }
 actual=$("$root/bin/vibes" report /synthetic/session.jsonl fixed)
 [ "$actual" = 'home:report /synthetic/session.jsonl fixed' ] || { echo "Report did not reach the configurable destination"; exit 1; }
-for command in refresh hotfix hotfix-check; do
+for command in refresh hotfix hotfix-check install-jobs; do
   if "$root/bin/vibes" "$command" >"$root/result" 2>&1; then
     echo "Home command unexpectedly allowed $command"; exit 1
   else

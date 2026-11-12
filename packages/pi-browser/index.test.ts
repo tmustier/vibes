@@ -1,10 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  chromeArguments,
   dismissDialogSafely,
   disconnectWithoutStopping,
+  isProfileChrome,
   normalizeRef,
   parseActivePort,
+  parseOpenFiles,
   truncate,
 } from "./index.ts";
 
@@ -55,4 +58,30 @@ test("dialog dismissal races cannot become unhandled rejections", async () => {
 
   await new Promise((resolvePromise) => setImmediate(resolvePromise));
   assert.equal(dismissals, 1);
+});
+
+test("only Chrome for Testing uses the mock keychain", () => {
+  // Chrome for Testing would prompt for its own Keychain item; the old Google
+  // Chrome profile can only be read with Chrome's real Keychain item.
+  assert.ok(chromeArguments("/profile", "mock").includes("--use-mock-keychain"));
+  assert.ok(!chromeArguments("/profile", "macos").includes("--use-mock-keychain"));
+  assert.ok(chromeArguments("/profile", "mock").includes("--user-data-dir=/profile"));
+});
+
+test("isProfileChrome accepts only a Chrome browser process with this profile's files open", () => {
+  const chrome = "/Caches/ms-playwright/chromium-1/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing";
+  const profile = "/Users/a/.pi/agent/browser/chrome-for-testing-profile";
+  const listing = (executable: string, ...files: string[]) =>
+    parseOpenFiles([`p1`, `fcwd`, `n/`, `ftxt`, `n${executable}`, ...files.flatMap((file, i) => [`f${i + 3}`, `n${file}`])].join("\n"));
+  assert.ok(isProfileChrome(listing(chrome, `${profile}/Default/History`), profile));
+  assert.ok(isProfileChrome(listing("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", `${profile}/Default/Cookies`), profile));
+  // Arguments can name Pi's profile while Chrome uses another; only open files count.
+  assert.ok(!isProfileChrome(listing(chrome, "/other/Default/History"), profile));
+  assert.ok(!isProfileChrome(listing(chrome, `${profile} other/Default/History`), profile));
+  assert.ok(!isProfileChrome(listing(chrome, `${profile}-other/Default/History`), profile));
+  assert.ok(!isProfileChrome(listing("/usr/local/bin/node", `${profile}/Default/History`), profile));
+  assert.ok(!isProfileChrome(listing(`${chrome} Helper`, `${profile}/Default/History`), profile));
+  assert.ok(!isProfileChrome(parseOpenFiles(`p1\nf3\nn${profile}/Default/History`), profile));
+  // A working directory inside Pi's profile is not an open profile file.
+  assert.ok(!isProfileChrome(parseOpenFiles(`p1\nfcwd\nn${profile}/Default/sub\nftxt\nn${chrome}\nf3\nn/other/Default/History`), profile));
 });

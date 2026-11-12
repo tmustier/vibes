@@ -191,7 +191,7 @@ export default function ampOrbs(pi: ExtensionAPI, { launch = launchOrb, open = o
 	});
 	pi.registerTool({
 		name: "send_thread_message", label: "Message Amp thread", executionMode: "sequential",
-		description: "Send a literal message directly to the Amp orb as a message from this Pi session, steering its next turn or answering a normal pending question. Re-arms background notification. Does not approve tools or bypass requiresHuman questions: resolve those in Amp. An acknowledgement means accepted, not completed. If delivery is uncertain, read status before retrying.",
+		description: "Send a literal message directly to the Amp orb as a message from this Pi session, steering its next turn or answering a normal pending question. Re-arms background notification. Does not approve tools or bypass requiresHuman questions: resolve those in Amp. An acknowledgement means accepted, not completed. If delivery is uncertain, read status before retrying: its sent.delivery shows whether Amp has the message.",
 		parameters: Type.Object({ threadId, message: Type.String({ minLength: 1 }) }),
 		async execute(_id, args, signal, _onUpdate, ctx) {
 			const ack = await get(args.threadId).send(args.message, { sessionId: ctx.sessionManager.getSessionId(), opening: false }, signal);

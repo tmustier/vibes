@@ -7,6 +7,8 @@ export PI_CODING_AGENT_DIR=$(mktemp -d)
 trap 'rm -rf "$PI_CODING_AGENT_DIR"' EXIT
 printf '{"packages":["%s"]}\n' "$PWD" >"$PI_CODING_AGENT_DIR/settings.json"
 
+[ "$(scripts/vibes check --help)" = 'usage: vibes check [dir]' ] || { echo 'FAIL check --help'; exit 1; }
+
 # The gog warning reads configuration only and never changes credentials or fails the check.
 source scripts/vibes
 (

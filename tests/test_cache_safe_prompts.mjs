@@ -11,6 +11,8 @@ import { NEW_HOOK, OLD_HOOK, patchRadiusWork } from "../lib/cache-safe-radius-wo
 const packageName = "@earendil-works/pi-radius-work";
 const scratch = mkdtempSync(join(tmpdir(), "vibes-prompt-deltas-"));
 test.after(() => rmSync(scratch, { recursive: true, force: true }));
+// The papercut wrapper reads feature choices from the agent directory; keep the host's out of the test.
+process.env.PI_CODING_AGENT_DIR = join(scratch, "agent");
 const write = (path, text) => { mkdirSync(dirname(path), { recursive: true }); writeFileSync(path, text); };
 
 function fixture(name, hook = OLD_HOOK, entry = `npm:${packageName}`) {

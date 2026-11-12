@@ -4,31 +4,32 @@
   "license": "MIT",
   "description": "Personal Pi setup and starter bundle",
   "type": "module",
-  "piDependencyCutoff": "2026-11-03T10:27:37.545Z",
+  "piDependencyCutoff": "2026-11-11T10:21:47.480Z",
   "scripts": {
     "typecheck": "tsc --noEmit",
     "test:anthropic-gzip": "node --test packages/pi-anthropic-gzip/index.test.ts && node tests/test_anthropic_gzip.mjs",
     "test:browser": "node --experimental-strip-types --test packages/pi-browser/index.test.ts && uv run packages/pi-browser/test_import_chrome_cookies.py"
   },
   "dependencies": {
+    "@earendil-works/pi-claude-code": "git+https://github.com/earendil-works/pi-claude-code.git#d5b5e04c314d3452d357174d16d10dda34daa2d2",
     "@earendil-works/pi-radius": "0.1.19",
     "@earendil-works/pi-voice": "0.2.0",
-    "@howaboua/pi-codex-conversion": "4.0.5",
-    "@howaboua/pi-codex-imagegen": "0.0.12",
+    "@howaboua/pi-codex-conversion": "4.0.9",
+    "@howaboua/pi-codex-imagegen": "0.0.13",
     "@tmustier/pi-anthropic-gzip": "file:packages/pi-anthropic-gzip",
     "@tmustier/pi-browser": "file:packages/pi-browser",
     "@tmustier/pi-queue-steer": "git+https://github.com/tmustier/pi-queue-steer.git#v0.2.2",
     "@tmustier/pi-session-hud": "latest",
     "codex-computer-use-mcp": "latest",
     "mitsupi": "1.6.0",
-    "pi-codex-goal": "0.6.1",
-    "pi-extensions": "0.1.74",
-    "pi-subagents": "github:nicobailon/pi-subagents#343ba73abeaf0a6e942a906ee4333a35f495b757",
-    "pi-web-access": "0.45.0",
-    "pi-you-should-know": "git+https://github.com/tmustier/pi-you-should-know.git#4ffceda99b625b633a1ea4fd0a253740947759da",
+    "pi-codex-goal": "0.7.8",
+    "pi-extensions": "0.1.77",
+    "pi-subagents": "0.88.0",
+    "pi-web-access": "0.47.0",
+    "pi-you-should-know": "git+https://github.com/tmustier/pi-you-should-know.git#f6c3e0e5241e81bb01e978ada6beb6bb4aa5c7c0",
     "pine-of-glass": "0.18.4",
     "read-agent-instructions": "git+https://github.com/tmustier/read-agent-instructions.git",
-    "surf-cli": "2.25.0"
+    "surf-cli": "2.26.0"
   },
   "pi": {
     "extensions": [
@@ -42,8 +43,8 @@
     ]
   },
   "devDependencies": {
-    "@earendil-works/pi-ai": "1.5.0",
-    "@earendil-works/pi-coding-agent": "1.5.0",
+    "@earendil-works/pi-ai": "1.5.2",
+    "@earendil-works/pi-coding-agent": "1.5.2",
     "@types/node": "26.6.3",
     "typescript": "7.0.2"
   }

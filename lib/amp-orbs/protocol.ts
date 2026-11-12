@@ -7,6 +7,8 @@ export type ThreadStatus = {
 	connection: "connecting" | "connected" | "disconnected"; connectionError?: string; archived: boolean;
 	state: string; settled: boolean; agentMode?: string; features: string[];
 	questions: Frame[]; approvals: Frame[]; error?: string; response: string; messageId?: string;
+	// The last message Pi sent. "unknown" until Amp acknowledges it or it appears in the thread.
+	sent?: { messageId: string; delivery: "unknown" | "accepted" | "rejected" };
 };
 /** Amp refuses observers for archived threads. Archiving is a deliberate end, not a failure. */
 export const archivedError = "Amp thread is archived";
@@ -81,18 +83,23 @@ export class ThreadState {
 		this.status = { ...this.status, connection: "disconnected", connectionError: error };
 		this.update();
 	}
-	rearm() {
+	rearm(messageId: string) {
 		this.pendingAfter = this.status.messageId ?? "";
 		this.ignoredQuestions = this.status.questions.map((q) => q.requestId);
 		this.started = false; this.failedAttempt = false; this.runtimeError = undefined;
 		this.episode++;
-		this.status = { ...this.status, error: undefined, state: "unknown" };
+		this.status = { ...this.status, error: undefined, state: "unknown", sent: { messageId, delivery: "unknown" } };
 		this.update();
 	}
+	/** Amp acknowledged the message rearm() announced. */
+	accept(messageId: string) {
+		this.status.sent = { messageId, delivery: "accepted" };
+	}
 	/** Undo rearm() after Amp definitely refused the message. */
-	cancelRearm() {
+	cancelRearm(messageId: string) {
 		this.pendingAfter = undefined;
 		this.ignoredQuestions = [];
+		this.status.sent = { messageId, delivery: "rejected" };
 	}
 	apply(frame: Frame | Frame[]) {
 		if (Array.isArray(frame)) {
@@ -120,6 +127,7 @@ export class ThreadState {
 		}
 		if (type === "message_added" && p.message.role === "user") {
 			this.replayedUserMessageId = p.message.messageId;
+			if (s.sent?.messageId === p.message.messageId) s.sent = { messageId: p.message.messageId, delivery: "accepted" };
 			if (s.connection === "connected" && p.message.messageId !== this.userMessageId) {
 				// A live appended input cannot settle on the previous reply while queued.
 				this.pendingAfter ??= s.messageId ?? "";

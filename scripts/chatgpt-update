@@ -1,0 +1,375 @@
+#!/usr/bin/env python3
+"""Stage native ChatGPT updates daily; enforce Saturdays at 04:00 local, including catch-up."""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import plistlib
+import signal
+import struct
+import subprocess
+import sys
+import tempfile
+import time
+
+ROOT = Path(__file__).resolve().parents[1]
+SPARKLE_VERSION = "2.10.1"
+SPARKLE_SHA256 = "1a856d2a9edb8e628de88121d7be04cf0e2167f8641650b78fca00b14244cf27"
+CLI_SHA256 = {
+    "SPUCommandLineDriver.h": "3f7d8efdd5b1be0e150ecb75795e70b0cd4fadbd1b18818b2dcf7c26f0dd6171",
+    "SPUCommandLineDriver.m": "0924b26df77f726afafed2bb149998c4c27813574c0a9e67ddf69cc0419490b1",
+    "SPUCommandLineUserDriver.h": "525cc91b76b7c88d3f0bc476cfdf0df72c50739c31d3ff71e9da9a6bb4773c42",
+    "SPUCommandLineUserDriver.m": "7e23c34763c74afbdbb7095cdd02d23343e9d0836e358e9da1099ff198e51600",
+    "main.m": "6df90a46bc481a76261f1b5c1a3123572f316fa3dc4463ab4269e2f5ecd0051e",
+}
+# agent-default (not a user rule): 2026-11-04. Daily staging, five-minute catch-up ticks,
+# ten minutes' warning, and bounded native commands. Saturday 04:00 is the user's rule.
+DAILY_SECONDS = 24 * 3600
+TICK_SECONDS = 300
+WARNING_SECONDS = 600
+COMMAND_SECONDS = 900
+RESUME_SECONDS = 60
+SLEEP_TOLERANCE_SECONDS = 60
+CLASSIC_BUNDLE_ID = "com.openai.chat"
+CURRENT_BUNDLE_ID = "com.openai.codex"
+
+
+def read_state(path):
+    return json.loads(path.read_text()) if path.exists() else {}
+
+
+def save_state(path, state):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, delete=False) as out:
+        json.dump(state, out, indent=2)
+        out.write("\n")
+        temporary = out.name
+    os.replace(temporary, path)
+
+
+def weekly_slot(now):
+    # Rebuild the local wall-clock boundary instead of subtracting elapsed seconds across DST.
+    local = dt.datetime.fromtimestamp(now.timestamp())
+    day = local.date() - dt.timedelta(days=(local.weekday() - 5) % 7)
+    boundary = dt.datetime.combine(day, dt.time(4))
+    if boundary > local:
+        boundary = dt.datetime.combine(day - dt.timedelta(days=7), dt.time(4))
+    return boundary.timestamp()
+
+
+def next_weekly_slot(now):
+    previous = dt.datetime.fromtimestamp(weekly_slot(now))
+    return dt.datetime.combine(previous.date() + dt.timedelta(days=7), dt.time(4)).timestamp()
+
+
+def command(args, timeout=COMMAND_SECONDS, detached=False):
+    # Only Sparkle's deferred installer may outlive the lock owner and Vibes' group cleanup.
+    # Active commands remain in this process group, so TERM to the scheduler stops them too.
+    process = subprocess.Popen([str(a) for a in args], start_new_session=detached)
+    try:
+        return process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        if detached:
+            os.killpg(process.pid, signal.SIGTERM)
+        else:
+            process.terminate()
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            if detached:
+                os.killpg(process.pid, signal.SIGKILL)
+            else:
+                process.kill()
+            process.wait(timeout=10)
+        raise RuntimeError("Native updater timed out; update remains pending")
+
+
+def checked(args, timeout=COMMAND_SECONDS):
+    code = command(args, timeout)
+    if code:
+        raise RuntimeError(f"{Path(str(args[0])).name} failed (exit {code})")
+
+
+def app_info(app):
+    with (app / "Contents/Info.plist").open("rb") as stream:
+        return plistlib.load(stream)
+
+
+def feed_url(app):
+    info = app_info(app)
+    if info.get("SUFeedURL"):
+        return info["SUFeedURL"]
+    # The Electron app keeps the publisher's native feed in package.json, not Info.plist.
+    # Read just the ASAR header and that entry, never the large webview payload.
+    with (app / "Contents/Resources/app.asar").open("rb") as stream:
+        header = stream.read(16)
+        tree = json.loads(stream.read(struct.unpack("<I", header[12:16])[0]))
+        entry = tree["files"]["package.json"]
+        stream.seek(8 + struct.unpack("<I", header[4:8])[0] + int(entry["offset"]))
+        return json.loads(stream.read(entry["size"]))["codexSparkleFeedUrl"]
+
+
+def build_helper(cache):
+    sources = ROOT / "vendor/sparkle-cli"
+    if {path.name for path in sources.glob("*.[mh]")} != set(CLI_SHA256):
+        raise RuntimeError("Unexpected Sparkle CLI source files")
+    fingerprint = hashlib.sha256(SPARKLE_SHA256.encode())
+    for name, expected in sorted(CLI_SHA256.items()):
+        data = (sources / name).read_bytes()
+        if hashlib.sha256(data).hexdigest() != expected:
+            raise RuntimeError(f"Sparkle CLI source checksum mismatch: {name}")
+        fingerprint.update(data)
+    destination = cache / fingerprint.hexdigest()[:16]
+    helper = destination / "sparkle.app/Contents/MacOS/sparkle"
+    if helper.is_file():
+        return helper
+    cache.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=".build-", dir=cache) as directory:
+        work = Path(directory)
+        archive = work / "Sparkle.tar.xz"
+        checked(["curl", "-fLsS", "--connect-timeout", "10", "--max-time", "120",
+                 f"https://github.com/sparkle-project/Sparkle/releases/download/{SPARKLE_VERSION}/Sparkle-{SPARKLE_VERSION}.tar.xz",
+                 "-o", archive])
+        if hashlib.sha256(archive.read_bytes()).hexdigest() != SPARKLE_SHA256:
+            raise RuntimeError("Sparkle archive checksum mismatch")
+        framework_dir = work / "sparkle.app/Contents/Frameworks"
+        framework_dir.mkdir(parents=True)
+        checked(["tar", "-xf", archive, "-C", framework_dir, "./Sparkle.framework"])
+        binary = work / "sparkle.app/Contents/MacOS/sparkle"
+        binary.parent.mkdir(parents=True)
+        with (work / "sparkle.app/Contents/Info.plist").open("wb") as stream:
+            plistlib.dump({"CFBundleExecutable": "sparkle", "CFBundleIdentifier": "ai.vibes.chatgpt-updater",
+                          "CFBundleName": "Vibes ChatGPT updater", "CFBundlePackageType": "APPL",
+                          "CFBundleShortVersionString": SPARKLE_VERSION, "CFBundleVersion": "1",
+                          "LSMinimumSystemVersion": "13.0", "LSUIElement": True}, stream)
+        checked(["xcrun", "clang", "-fobjc-arc", "-fblocks", "-DSPU_OBJC_DIRECT_MEMBERS=", "-DSPU_OBJC_DIRECT=",
+                 "-F", framework_dir, "-framework", "Sparkle", "-framework", "Cocoa",
+                 *sorted(sources.glob("*.m")), "-Wl,-rpath,@executable_path/../Frameworks", "-o", binary])
+        checked(["codesign", "--force", "--sign", "-", work / "sparkle.app"])
+        archive.unlink()
+        os.rename(work, destination)
+    return helper
+
+
+class NativeUpdater:
+    def __init__(self, app, cache, application=None):
+        self.app, self.cache = app, cache
+        self.application = application or app
+        self.helper = None
+
+    def present(self):
+        # A broken or unrecognised installed bundle is an error, not permission to replace it.
+        return self.app.exists()
+
+    def classic(self):
+        # The older ChatGPT app has no Computer Use, so it must give way to ChatGPT for Work.
+        try:
+            return app_info(self.app).get("CFBundleIdentifier") == CLASSIC_BUNDLE_ID
+        except (OSError, ValueError):
+            return False  # Missing or unreadable: the normal path installs it or reports the error.
+
+    def replace_classic(self):
+        if self.running():
+            checked(["osascript", "-e", f'tell application id "{CLASSIC_BUNDLE_ID}" to quit'], timeout=30)
+            end = time.monotonic() + RESUME_SECONDS
+            while self.running():
+                if time.monotonic() >= end:
+                    raise RuntimeError("The older ChatGPT app did not quit; replacement is still pending")
+                time.sleep(1)
+        checked(["brew", "install", "--cask", "--force", "chatgpt"])
+        if app_info(self.app).get("CFBundleIdentifier") != CURRENT_BUNDLE_ID:
+            raise RuntimeError("Homebrew did not install ChatGPT for Work; replacement is still pending")
+        self.verify(False)
+
+    def install(self):
+        # Installation only. Never ask Homebrew to replace an installed app.
+        if self.app != Path("/Applications/ChatGPT.app"):
+            raise RuntimeError("Test application is missing")
+        checked(["brew", "install", "--cask", "chatgpt"])
+
+    def version(self):
+        return str(app_info(self.app)["CFBundleVersion"])
+
+    def running(self):
+        # Match the executable path, not every app sharing the same bundle identifier.
+        executable = app_info(self.application)["CFBundleExecutable"]
+        target = os.path.realpath(self.application / "Contents/MacOS" / executable)
+        result = subprocess.run(["ps", "-axo", "comm="], capture_output=True, text=True, check=True)
+        return target in {os.path.realpath(path) for path in result.stdout.splitlines() if path.startswith("/")}
+
+    def invoke(self, flags):
+        self.helper = self.helper or build_helper(self.cache)
+        arguments = [self.helper, self.app, *flags, "--feed-url", feed_url(self.app),
+                     "--user-agent-name", "Personal Vibes"]
+        if "--probe" not in flags:
+            arguments.extend(["--application", self.application])
+        return command(arguments, detached="--defer-install" in flags)
+
+    def probe(self):
+        result = self.invoke(["--probe"])
+        if result not in (0, 4):
+            raise RuntimeError(f"Native update check failed (exit {result}); will retry")
+        return result == 0
+
+    def stage(self):
+        result = self.invoke(["--check-immediately", "--defer-install"])
+        if result not in (0, 4):
+            raise RuntimeError(f"Native update preparation failed (exit {result}); will retry")
+
+    def verify(self, restore_running=False):
+        checked(["codesign", "--verify", "--deep", "--strict", self.app])
+        if restore_running:
+            if not self.running():
+                checked(["open", "-g", self.application], timeout=30)
+            end = time.monotonic() + RESUME_SECONDS
+            while not self.running():
+                if time.monotonic() >= end:
+                    raise RuntimeError("ChatGPT did not reopen; deadline is still pending")
+                time.sleep(1)
+
+    def enforce(self):
+        result = self.invoke(["--check-immediately"])
+        if result not in (0, 4):
+            raise RuntimeError(f"Native update failed (exit {result}); will retry without a password dialog")
+
+
+def notify(message):
+    # Arguments keep app/version text out of AppleScript source.
+    script = 'on run argv\n display notification (item 1 of argv) with title "ChatGPT update"\nend run'
+    checked(["osascript", "-e", script, message], timeout=30)
+
+
+def boot_id():
+    return subprocess.check_output(["sysctl", "-n", "kern.boottime"], text=True).strip()
+
+
+def awake_seconds():
+    # Each tick is a new process, so sleep detection needs a clock shared across processes: time since
+    # boot, paused during sleep. The system Python launchd runs restarts time.monotonic() per process.
+    return time.clock_gettime(time.CLOCK_UPTIME_RAW)
+
+
+def run(path, native, now, boot, notice=notify, clock=None, monotonic=awake_seconds):
+    clock = clock or (lambda: now.timestamp())
+    state = read_state(path)
+    current = now.timestamp()
+    elapsed_wall = current - state.get("lastTickAt", current)
+    elapsed_awake = monotonic() - state.get("lastAwake", monotonic())
+    slept = elapsed_wall - elapsed_awake > SLEEP_TOLERANCE_SECONDS
+    slot = weekly_slot(now)
+    overdue = state.get("completedSlot", 0) < slot
+    upcoming = next_weekly_slot(now)
+    advance_warning = not overdue and upcoming - current <= WARNING_SECONDS
+    warning_slot = slot if overdue else upcoming
+    # A wake, reboot or long gap gets a fresh warning before a caught-up restart.
+    # lastMonotonic came from a per-process clock that cannot show sleep, so its warning is not trusted.
+    fresh = state.get("boot") != boot or slept or elapsed_wall < 0 or "lastAwake" not in state
+    if fresh:
+        state.pop("warningAt", None)
+    state.pop("lastMonotonic", None)
+    state.update(lastTickAt=current, lastAwake=monotonic(), boot=boot)
+    save_state(path, state)
+    replacing = "replaceWarningAt" in state or state.get("enforcementWasRunning") or native.classic()
+    if not overdue and not advance_warning and not replacing and current - state.get("lastCheckAt", 0) < DAILY_SECONDS:
+        return 0
+    try:
+        if not native.present():
+            native.install()
+        elif native.classic():
+            running = native.running()
+            if running and "replaceWarningAt" not in state:
+                notice("ChatGPT will be replaced with ChatGPT for Work, which Computer Use needs, in 10 minutes. Please finish active work.")
+                state.update(replaceWarningAt=clock(), status="replace-warning")
+                save_state(path, state)
+                print("ChatGPT: replacing the older app in 10 minutes")
+                return 0
+            if running and clock() - state["replaceWarningAt"] < WARNING_SECONDS:
+                return 0
+            # Reopening is retried below on every tick until it succeeds, like a Saturday restart.
+            state.pop("replaceWarningAt", None)
+            if running:
+                state["enforcementWasRunning"] = True
+            save_state(path, state)
+            native.replace_classic()
+        if state.get("enforcementWasRunning"):
+            native.verify(True)  # Recovery must not depend on the network.
+            state.pop("enforcementWasRunning", None)
+            save_state(path, state)
+        available = native.probe()  # Network errors never satisfy a missed Saturday.
+        if not available:
+            native.verify(False)
+            if overdue:
+                state["completedSlot"] = slot
+            state.update(lastCheckAt=current, version=native.version(), status="current")
+            state.pop("warningAt", None)
+            state.pop("enforcementWasRunning", None)
+        elif overdue or advance_warning:
+            running = native.running()
+            warned = "warningAt" in state and state.get("warningSlot") == warning_slot
+            if overdue and running and warned and clock() - state["warningAt"] >= WARNING_SECONDS:
+                state["enforcementWasRunning"] = True
+                save_state(path, state)  # A crash must not forget that an open app needs reopening.
+                native.enforce()
+                native.verify(True)
+                state.pop("enforcementWasRunning", None)
+                if native.probe():
+                    raise RuntimeError("A newer update remains available; deadline is still pending")
+                state.update(completedSlot=slot, lastCheckAt=clock(), version=native.version(), status="updated")
+                state.pop("warningAt", None)
+            elif running and not warned:
+                # Persist only after the notification command succeeds. Never sleep through a deadline.
+                notice("ChatGPT has an update. It will update and relaunch in 10 minutes. Please finish active work.")
+                state.update(warningAt=clock(), warningSlot=warning_slot, status="restart-warning")
+                save_state(path, state)
+                native.stage()
+            elif not running:
+                # Deferred installation avoids an unannounced restart if the user opens it now.
+                native.stage()
+                state.update(lastCheckAt=clock(), status="staged")
+            else:
+                state["status"] = "restart-warning"
+        else:
+            native.stage()
+            state.update(lastCheckAt=current, status="staged", version=native.version())
+        state.pop("error", None)
+        save_state(path, state)
+        print(f"ChatGPT: {state['status']}; weekly deadline Saturday 04:00 local")
+        return 0
+    except (OSError, ValueError, KeyError, RuntimeError, subprocess.SubprocessError) as error:
+        # Offline, refused quits and permission failures stay overdue across weeks and reboots.
+        state.update(status="retry-pending", error=str(error))
+        state.pop("warningAt", None)  # Reconnection must not cause an unannounced immediate restart.
+        save_state(path, state)
+        print(f"ChatGPT: {error}", file=sys.stderr)
+        return 1
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--app", type=Path, default=Path("/Applications/ChatGPT.app"))
+    parser.add_argument("--application", type=Path, help="App to watch/relaunch; defaults to --app")
+    parser.add_argument("--state-dir", type=Path, default=Path(os.environ.get("PI_CODING_AGENT_DIR") or Path.home()/".pi/agent"))
+    parser.add_argument("--status", action="store_true")
+    args = parser.parse_args(argv)
+    path = args.state_dir / "vibes-chatgpt-update.json"
+    if args.status:
+        print(json.dumps(read_state(path), indent=2))
+        return 0
+    args.state_dir.mkdir(parents=True, exist_ok=True)
+    with (args.state_dir / "vibes-update.flock").open("a") as lock:
+        if not os.environ.get("VIBES_UPDATE_LOCKED"):
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return 75
+        native = NativeUpdater(args.app.resolve(), args.state_dir / "chatgpt-updater", args.application)
+        return run(path, native, dt.datetime.now(dt.timezone.utc), boot_id())
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -95,7 +95,9 @@ try {
 		VIBES=$2 STATUS_FILE=$3/status.json NOTES_FILE=$3/notes LOG_FILE=$3/log PI_1_MARKER=$3/pi-1-verified.json
 		printf '{"version":"1.0.0"}\n' >"$PI_1_MARKER"
 		VIBES_UPDATE_LOCKED=1 VIBES_UPDATE_CONTINUED=1 VIBES_UPDATE_PREVIOUS=$4 VIBES_UPDATE_RESULTS=$'packages\\tok\\t'
-		for f in load_nvm update_surf sync_settings install_pinned_pi install_hotfix_job install_refresh_job update_repo cmd_check osascript; do eval "$f() { :; }"; done
+		for f in load_nvm ensure_claude_code update_surf sync_settings install_pinned_pi update_models install_update_job install_hotfix_job install_refresh_job install_chatgpt_job update_repo cmd_check osascript; do eval "$f() { :; }"; done
+		calls=$3/launchctl
+		launchctl() { echo "$*" >>"$calls"; }
 		mkdir -p "$VIBES/scripts"
 		printf '#!/bin/bash\\nexit 0\\n' >"$VIBES/scripts/inventory"
 		chmod +x "$VIBES/scripts/inventory"
@@ -103,6 +105,8 @@ try {
 		cp "$1/scripts/refresh" "$VIBES/scripts/refresh"
 		cmd_update
 	`, "_", root, installed, scratch, previous]);
+	// HOME is scratch here, so a job loaded into the real launchd session would point at a deleted folder.
+	assert.ok(!fs.existsSync(path.join(scratch, "launchctl")), "the update test never calls launchctl");
 	for (const name of owned) assert.equal(versionOf(name), versions[1], `nightly latest refresh: ${name}`);
 	for (const name of ["pinned-fixture", "transitive-fixture"]) assert.equal(versionOf(name), versions[0], `unrelated locked dependency: ${name}`);
 	assert.equal(fs.readFileSync(path.join(installed, "package.json"), "utf8"), packageBefore);

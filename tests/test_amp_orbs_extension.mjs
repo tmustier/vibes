@@ -8,6 +8,7 @@ const plugin = (name, request) => ({ jsonrpc: "2.0", method: "plugin_message", p
 const agentState = (state, messageId) => ({ jsonrpc: "2.0", method: "agent_state", params: { state, messageId } });
 let snapshot = [{ type: "agent_state", state: "running_tools", messageId: "m1" }, { type: "plugin_message", message: { event: "plugin.ui.snapshot", data: { requests: [] } } }];
 let acceptMessages = true;
+let acknowledgeMessages = true;
 
 const sockets = [];
 class FakeSocket extends EventTarget {
@@ -21,7 +22,7 @@ class FakeSocket extends EventTarget {
 				const replay = frame.params.version === 0 ? snapshot : snapshot.filter((event) => event.type !== "message_added");
 				this.receive(replay); this.receive({ id: 1, result: {} });
 			}
-			else this.receive(acceptMessages ? { id: frame.id, result: { ok: true } } : { id: frame.id, error: { message: "denied" } });
+			else if (acknowledgeMessages) this.receive(acceptMessages ? { id: frame.id, result: { ok: true } } : { id: frame.id, error: { message: "denied" } });
 		});
 	}
 	receive(frame) { this.dispatchEvent(new MessageEvent("message", { data: JSON.stringify(frame) })); }
@@ -328,6 +329,7 @@ function wakeSession(entries = []) {
 		messages, entries,
 		call: async (name, args) => JSON.parse((await tools.get(name).execute("call", args, undefined, undefined, ctx)).content[0].text),
 		event: (frame) => socket.receive(frame),
+		socket: () => socket,
 		start: () => handlers.get("session_start")({}, ctx),
 		stop: () => handlers.get("session_shutdown")({}, ctx),
 		settle: async (stopReason) => {
@@ -476,5 +478,24 @@ await test("reload preserves hold deadlines and the 5, 15, 60, 60 progression", 
 	session.event(agentState("working", "again")); session.event(replay("idle", "again-done", "AGAIN"));
 	await advance(80); assert.equal(session.messages.length, 1);
 	await advance(40); assert.equal(session.messages.length, 2, "success resets backoff to the first step");
+});
+await test("an unacknowledged message returns its ID, and status shows once the thread has it", async (t) => {
+	const user = (messageId) => ({ type: "message_added", message: { role: "user", messageId, content: [{ type: "text", text: "Blue" }] } });
+	const session = wakeSession(); t.after(async () => { acknowledgeMessages = true; await session.stop(); });
+	snapshot = replay("idle", "m1", "BEFORE");
+	await session.start(); await session.call("get_thread_status", { threadId: id });
+	acknowledgeMessages = false;
+	const sending = session.call("send_thread_message", { threadId: id, message: "Blue" }).catch((error) => error);
+	await waitUntil(() => session.socket()?.sent.at(-1)?.method === "client_append_user_msg");
+	const { messageId } = session.socket().sent.at(-1).params;
+	session.socket().dispatchEvent(new Event("close"));
+	assert.match((await sending).message, new RegExp(`acknowledgement unknown\\. Message ${messageId}: read get_thread_status`));
+	assert.deepEqual((await session.call("get_thread_status", { threadId: id })).sent, { messageId, delivery: "unknown" }, "a thread without the message leaves delivery unknown");
+	snapshot = [...replay("idle", "m1", "BEFORE"), user(messageId), { type: "agent_state", state: "working", messageId: "m1" }];
+	session.socket().dispatchEvent(new Event("close"));
+	assert.deepEqual((await session.call("get_thread_status", { threadId: id })).sent, { messageId, delivery: "accepted" }, "replay reconciles the uncertain send");
+	acknowledgeMessages = true;
+	const ack = await session.call("send_thread_message", { threadId: id, message: "Green" });
+	assert.deepEqual((await session.call("get_thread_status", { threadId: id })).sent, { messageId: ack.messageId, delivery: "accepted" });
 });
 console.log("ok: amp-orbs extension");

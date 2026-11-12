@@ -25,6 +25,7 @@ try {
   assert.equal(models.providers["openai-codex"].modelOverrides["gpt-6.1-sol"].contextWindow, 500000);
   assert.equal(models.providers["openai-codex"].modelOverrides["gpt-6.1-sol"].maxTokens, 8192);
   assert.deepEqual(models.providers.anthropic, unrelated.providers.anthropic);
+  assert.equal(models.providers.anthropic.models, undefined, "Fable uses the registry, not a replacement model definition");
   const compaction = read(join(agent, "settings.json")).compaction;
   const reserveTokens = compaction.modelOverrides["openai-codex/gpt-6.1-sol"].reserveTokens;
   assert.equal(reserveTokens, 50000);
