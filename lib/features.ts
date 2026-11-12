@@ -6,6 +6,7 @@ export const featureDefaults = {
 	"anthropic-gzip": true,
 	browser: true,
 	"claude-artifacts": true,
+	"claude-code": true,
 	"code-actions": true,
 	"computer-use": true,
 	contextimate: true,

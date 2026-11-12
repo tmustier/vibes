@@ -46,6 +46,7 @@ const runtime = await ModelRuntime.create({ credentials, modelsPath, allowModelN
 let enabled = true;
 let legacy = false;
 let session;
+const largePrompt = "Reply OK. " + "Synthetic user context. ".repeat(400);
 try {
 	for (const order of ["gzip-first", "gzip-last"]) {
 		fs.writeFileSync(modelsPath, JSON.stringify(config));
@@ -81,6 +82,14 @@ try {
 		assert.equal(first.headers.get("x-gzip-fixture"), "preserved");
 		assert.equal(session.getLastAssistantText(), "OK");
 
+		// Pi 1.5.2 sends only the small delta on a message-thread continuation.
+		await session.prompt("Reply OK.");
+		const continued = requests.at(-1);
+		assert.equal(continued.payload.thread.type, "continue");
+		assert.equal(continued.payload.thread.previous_message_id, "msg_fixture");
+		assert.equal(continued.gzip, false, "Small thread deltas must pass through without compression");
+		assert.equal(session.getLastAssistantText(), "OK");
+
 		// A removed model setting must disappear immediately on refresh, not get baked into a decorator.
 		fs.writeFileSync(modelsPath, JSON.stringify({ providers: { anthropic: { baseUrl: "https://config.invalid" } } }));
 		await runtime.refresh({ allowNetwork: false });
@@ -90,7 +99,7 @@ try {
 		for (let n = 0; n < 2; n++) {
 			await session.reload();
 			assert.equal(globalThis.fetch, dispatcher, "Reload must reuse the stable fetch dispatcher");
-			await session.prompt("Reply OK."); assert(requests.at(-1).gzip);
+			await session.prompt(largePrompt); assert(requests.at(-1).gzip);
 			assert.equal(requests.at(-1).payload.speed, "fast", "Reload must use the active new fast-mode instance");
 		}
 		// Endpoint override passes through, even while compression is enabled.
@@ -102,7 +111,7 @@ try {
 		// Rejection retries identity once, then later requests remain plain until reload.
 		rejectGzip = true;
 		const count = requests.length;
-		await session.prompt("Reply OK.");
+		await session.prompt(largePrompt);
 		assert.deepEqual(requests.slice(count).map((r) => r.gzip), [true, false]);
 		await session.prompt("Reply OK."); assert.equal(requests.at(-1).gzip, false);
 		rejectGzip = false;
@@ -111,7 +120,7 @@ try {
 		await session.prompt("Reply OK."); assert.equal(requests.at(-1).gzip, false);
 		assert.equal(requests.at(-1).payload.speed, "fast");
 		enabled = true; await session.reload();
-		await session.prompt("Reply OK."); assert(requests.at(-1).gzip);
+		await session.prompt(largePrompt); assert(requests.at(-1).gzip);
 		await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
 		await session.dispose(); session = undefined;
 		assert.equal(globalThis.fetch, fixtureFetch);

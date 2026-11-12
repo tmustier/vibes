@@ -12,6 +12,8 @@ Use a simple two-layer stack:
 
 `gws` here is a local authenticated wrapper around the vendored Google Workspace CLI. It reuses the user's existing `gog` credentials, so it should work without a separate `gws auth login` flow.
 
+Before the first Google call in a session, check which CLI is signed in: `gog auth list --check --json`, and if gog has no working account, `gws-raw auth status`. Use whichever works (`gws-raw` takes the same commands as `gws`, with its own login). Start a browser sign-in only when neither does.
+
 ## Core rules
 
 ### 1) Edit live Google objects in place

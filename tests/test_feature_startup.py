@@ -53,14 +53,15 @@ with tempfile.TemporaryDirectory(prefix="vibes-feature-startup-") as scratch:
     config.write_text(json.dumps({"features": {"claude-artifacts": False}}))
     assert not {"skill:artifact-design", "skill:artifact-capabilities"} & commands(agent, project), "the feature opt-out also removes its skills"
     config.unlink()
-    assert {"skill:surf", "open", "ysk"} <= default
+    assert {"skill:surf", "open", "ysk", "claude-code-status"} <= default
     settings.write_text(json.dumps({"packages": [str(ROOT), str(ROOT / "node_modules/pi-you-should-know")]}))
     assert "ysk" in commands(agent, project), "a separately installed copy must not register /ysk twice"
     settings.write_text(json.dumps({"packages": [str(ROOT)]}))
-    config.write_text(json.dumps({"features": {"cachemire": True, "meantime": True, "surf": False, "open": False, "you-should-know": False}}))
+    config.write_text(json.dumps({"features": {"cachemire": True, "meantime": True, "surf": False, "open": False, "you-should-know": False, "claude-code": False}}))
     opted = commands(agent, project)
     assert "cache" in opted and "pace" not in opted and "skill:surf" not in opted, "Vibes must not bypass the Meantime experimental flag"
     assert "open" not in opted and "ysk" not in opted, "named opt-outs also disable Vibes-owned extensions"
+    assert "claude-code-status" not in opted, "personal opt-out disables the Claude Code provider"
     config.write_text(json.dumps({"features": {"typo": True}}))
     try:
         commands(agent, project)
@@ -76,9 +77,10 @@ with tempfile.TemporaryDirectory(prefix="vibes-feature-startup-") as scratch:
     native_config.write_text(json.dumps({"enabled": False}))
     assert "pace" not in commands(agent, project), "explicit extension opt-out remains authoritative"
     native_config.write_text(json.dumps({"enabled": True}))
-    settings.write_text(json.dumps({"packages": [{"source": str(ROOT), "extensions": ["!extensions/cachemire.ts", "-extensions/meantime.ts"]}]}))
+    settings.write_text(json.dumps({"packages": [{"source": str(ROOT), "extensions": ["!extensions/cachemire.ts", "-extensions/meantime.ts", "!extensions/claude-code.ts"]}]}))
     native = commands(agent, project)
     assert "cache" not in native and "pace" not in native, "native exclusions beat true"
+    assert "claude-code-status" not in native, "native Claude Code exclusion remains supported"
 
     # Actual scratch personal migration, then Pi loads the same installed Vibes copy.
     config.write_text(json.dumps({"features": {"cachemire": True, "meantime": True}}))

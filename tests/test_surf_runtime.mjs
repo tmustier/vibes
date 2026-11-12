@@ -2,15 +2,22 @@
 // fake npm transport. No user's Chrome, global package or native manifest is touched.
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { createRequire } from "node:module";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const upstream = path.join(repo, "node_modules/surf-cli");
-const { BROWSERS } = createRequire(import.meta.url)(path.join(upstream, "native/doctor.cjs"));
+const require = createRequire(import.meta.url);
+const { BROWSERS } = require(path.join(upstream, "native/doctor.cjs"));
+const { SURF_EXTENSION_ID } = require(path.join(upstream, "scripts/install-native-host.cjs"));
+const extensionKey = JSON.parse(fs.readFileSync(path.join(upstream, "dist/manifest.json"))).key;
+const derivedId = createHash("sha256").update(Buffer.from(extensionKey, "base64")).digest("hex").slice(0, 32).replace(/[0-9a-f]/g, (digit) => String.fromCharCode(97 + parseInt(digit, 16)));
+assert.equal(SURF_EXTENSION_ID, derivedId, "Registration must authorize the ID Chrome derives from the manifest key");
+const stockOrigin = `chrome-extension://${SURF_EXTENSION_ID}/`;
 const pin = JSON.parse(fs.readFileSync(path.join(repo, "package.json"))).dependencies["surf-cli"];
 const scratch = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "vibes-surf-")));
 const home = path.join(scratch, "home with spaces");
@@ -36,6 +43,7 @@ const command = (mode, args = [], status = 0, extra = {}) => {
 try {
 	fs.mkdirSync(bin, { recursive: true });
 	fs.mkdirSync(agent, { recursive: true });
+	for (const dir of [path.join(agent, "skills"), path.join(home, ".claude/skills")]) fs.mkdirSync(dir, { recursive: true });
 	fs.symlinkSync(process.execPath, path.join(bin, "node"));
 	write(path.join(bin, "npm"), `#!${process.execPath}
 const fs = require('fs'), path = require('path'), assert = require('assert/strict');
@@ -47,7 +55,8 @@ if (process.env.SURF_TEST_FAIL) process.exit(7);
 const root = path.join(args[3], 'lib/node_modules/surf-cli');
 for (const dir of ['native','dist', '../../..' + '/bin']) fs.mkdirSync(path.join(root,dir), {recursive:true});
 fs.writeFileSync(path.join(root,'package.json'), JSON.stringify({name:'surf-cli', version:process.env.SURF_TEST_PIN}));
-fs.writeFileSync(path.join(root,'dist/manifest.json'), JSON.stringify({version:process.env.SURF_TEST_PIN}));
+const key = JSON.parse(fs.readFileSync(path.join(process.env.SURF_TEST_UPSTREAM,'dist/manifest.json'))).key;
+fs.writeFileSync(path.join(root,'dist/manifest.json'), JSON.stringify({version:process.env.SURF_TEST_PIN, key}));
 fs.writeFileSync(path.join(root,'native/host.cjs'), '// fixture host');
 fs.writeFileSync(path.join(root,'native/cli.cjs'), '#!/usr/bin/env node\\n');
 fs.chmodSync(path.join(root,'native/cli.cjs'), 0o755);
@@ -62,7 +71,10 @@ if (!fs.existsSync(bin)) fs.symlinkSync(path.join(root,'native/cli.cjs'), bin);
 	assert.match(command("setup"), /browser setup is incomplete/);
 	assert.equal(json(path.join(installed, "package.json")).version, pin);
 	command("setup", [id]);
-	assert.deepEqual(json(manifest("chrome")).allowed_origins, [`chrome-extension://${id}/`]);
+	assert.deepEqual(json(manifest("chrome")).allowed_origins, [stockOrigin, `chrome-extension://${id}/`]);
+	for (const file of [path.join(agent, "skills/surf"), path.join(home, ".claude/skills/surf")]) {
+		assert.equal(fs.existsSync(file), false, "Native-host registration must not add agent skills");
+	}
 	assert.match(fs.readFileSync(wrapper, "utf8"), new RegExp(process.execPath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
 	command("check");
 	// Reproduce the real July global install + old Homebrew Node, preserving both IDs and metadata.
@@ -75,13 +87,17 @@ if (!fs.existsSync(bin)) fs.symlinkSync(path.join(root,'native/cli.cjs'), bin);
 	write(manifest("brave"), JSON.stringify(before));
 	assert.match(command("check", [], 1), /2\.9\.0.*Vibes=/);
 	assert.equal(fs.readFileSync(wrapper, "utf8"), oldWrapper, "check is read-only");
-	assert.match(command("update"), /reloaded at chrome:\/\/extensions/);
+	const frozenClock = path.join(scratch, "frozen-clock.mjs");
+	write(frozenClock, "Date.now = () => 1700000000000;\n");
+	assert.match(command("update", [], 0, { NODE_OPTIONS: `--import=${pathToFileURL(frozenClock).href}` }), /reloaded at chrome:\/\/extensions/);
 	const calls = fs.readFileSync(env.SURF_TEST_CALLS, "utf8").trim().split("\n").map(JSON.parse);
 	assert.deepEqual(calls.at(-1), ["install", "-g", "--prefix", prefix, `surf-cli@${pin}`]);
-	assert.deepEqual(json(manifest("chrome")), before);
-	assert.deepEqual(json(manifest("brave")), before);
+	const migrated = { ...before, allowed_origins: [...before.allowed_origins, stockOrigin] };
+	assert.deepEqual(json(manifest("chrome")), migrated);
+	assert.deepEqual(json(manifest("brave")), migrated);
 	assert.equal(json(path.join(installed, "dist/manifest.json")).version, pin);
-	assert(fs.readdirSync(path.dirname(wrapper)).some((name) => name.includes(".vibes-backup-")));
+	const wrapperBackups = fs.readdirSync(path.dirname(wrapper)).filter((name) => name.startsWith("host-wrapper.sh.vibes-backup-"));
+	assert(wrapperBackups.some((name) => fs.readFileSync(path.join(path.dirname(wrapper), name), "utf8") === oldWrapper), "The original shared wrapper must survive migration of multiple browsers in the same millisecond");
 	command("check");
 	const current = fs.readFileSync(wrapper, "utf8");
 	const notes = fs.readFileSync(path.join(agent, "vibes-update-notes"), "utf8");
@@ -89,6 +105,22 @@ if (!fs.existsSync(bin)) fs.symlinkSync(path.join(root,'native/cli.cjs'), bin);
 	assert.equal(fs.readFileSync(env.SURF_TEST_CALLS, "utf8").trim().split("\n").length, calls.length, "aligned runtime does not reinstall");
 	assert.equal(fs.readFileSync(path.join(agent, "vibes-update-notes"), "utf8"), notes, "aligned runtime does not renotify");
 	assert.equal(fs.readFileSync(wrapper, "utf8"), current);
+	// The version and wrapper can already match while native-host authorization is stale.
+	for (const browser of ["chrome", "brave"]) write(manifest(browser), JSON.stringify(before));
+	assert.match(command("check", [], 1), /registration differs.*extension ID/);
+	assert.deepEqual(json(manifest("chrome")), before, "check must not repair authorization");
+	command("update");
+	for (const browser of ["chrome", "brave"]) {
+		assert.deepEqual(json(manifest(browser)), migrated);
+		const backups = fs.readdirSync(path.dirname(manifest(browser))).filter((name) => name.startsWith("surf.browser.host.json.vibes-backup-"));
+		assert(backups.some((name) => JSON.stringify(json(path.join(path.dirname(manifest(browser)), name))) === JSON.stringify(before)), "The old native manifest must remain recoverable");
+	}
+	assert.equal(fs.readFileSync(wrapper, "utf8"), current);
+	assert.equal(fs.readFileSync(env.SURF_TEST_CALLS, "utf8").trim().split("\n").length, calls.length, "identity repair must not reinstall Surf");
+	command("check");
+	const repairedNotes = fs.readFileSync(path.join(agent, "vibes-update-notes"), "utf8");
+	command("update");
+	assert.equal(fs.readFileSync(path.join(agent, "vibes-update-notes"), "utf8"), repairedNotes, "identity repair is idempotent");
 	// Node-only drift repairs registration without reinstalling npm.
 	write(wrapper, oldWrapper);
 	assert.match(command("check", [], 1), /registration differs/);

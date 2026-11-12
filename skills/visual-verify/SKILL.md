@@ -36,10 +36,7 @@ Pass both `--window-id "$WIN"` and `--tab-id "$TAB"` on every later page command
 
 Take **two screenshots** — one for detail, one for context:
 
-1. **Element screenshot** — the specific thing that changed. Higher effective resolution because it is smaller than the whole viewport.
-   ```bash
-   surf --window-id "$WIN" --tab-id "$TAB" screenshot --selector ".review-tab-table" --output /tmp/vv-element.png
-   ```
+1. **Element screenshot** — the specific thing that changed, cropped from a full-resolution viewport capture. `surf screenshot` has no `--selector` option and ignores it, so crop the element yourself (see step 3 below).
 
 2. **Full viewport screenshot** — the whole page at the working viewport. Shows layout relationships.
    ```bash
@@ -57,8 +54,14 @@ surf --window-id "$WIN" --tab-id "$TAB" emulate.viewport --width 1440 --height 9
 # 2. Wait for the page
 surf --window-id "$WIN" --tab-id "$TAB" wait.network
 
-# 3. Element screenshot (the changed thing)
-surf --window-id "$WIN" --tab-id "$TAB" screenshot --selector "<css-selector>" --output /tmp/vv-element.png
+# 3. Element screenshot (the changed thing): scroll it into view, read its box in device pixels,
+#    capture the viewport at full resolution and crop
+SEL="<css-selector>"
+surf --window-id "$WIN" --tab-id "$TAB" js "document.querySelector('$SEL').scrollIntoView({block: 'center'})"
+BOX=$(surf --window-id "$WIN" --tab-id "$TAB" js "(() => { const r = document.querySelector('$SEL').getBoundingClientRect(), d = devicePixelRatio; return [r.left, r.top, r.width, r.height].map(v => Math.round(v * d)).join(' ') })()" | tail -1 | tr -d '"')
+surf --window-id "$WIN" --tab-id "$TAB" screenshot --full --output /tmp/vv-viewport.png
+read X Y W H <<<"$BOX"
+sips -c "$H" "$W" --cropOffset "$Y" "$X" /tmp/vv-viewport.png --out /tmp/vv-element.png
 
 # 4. Full viewport screenshot
 surf --window-id "$WIN" --tab-id "$TAB" screenshot --output /tmp/vv-full.png

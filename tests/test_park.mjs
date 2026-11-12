@@ -7,6 +7,8 @@ import test from "node:test";
 import park, { decodeParkRecord, encodeParkRecord, relaunchArgs } from "../extensions/park.ts";
 
 const WRAPPER = new URL("../scripts/pi-park", import.meta.url).pathname;
+// The park wrapper reads feature choices from the agent directory; keep the host's out of the test.
+process.env.PI_CODING_AGENT_DIR = mkdtempSync(join(tmpdir(), "park-agent-"));
 
 test("relaunchArgs keeps runtime flags and drops session selection and prompts", () => {
 	const argv = relaunchArgs(

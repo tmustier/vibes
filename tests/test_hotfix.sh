@@ -32,6 +32,7 @@ run() {
 		export VIBES_UPDATE_LOCKED=1
 		update_vibes_packages() { echo packages >>"$scratch/calls"; git -C "$VIBES" pull -q origin main 2>/dev/null; }
 		refresh_rolling_packages() { echo rolling-packages >>"$scratch/calls"; [ ! -e "$scratch/rolling-fails" ]; }
+		ensure_claude_code() { echo claude-code >>"$scratch/calls"; }
 		update_surf() { echo surf >>"$scratch/calls"; [ ! -e "$scratch/surf-fails" ]; }
 		sync_settings() { echo settings >>"$scratch/calls"; }
 		install_pinned_pi() { echo pi >>"$scratch/calls"; }
@@ -48,12 +49,17 @@ printf '#!/bin/bash\necho 1.0.0\n' >"$scratch/pi" && chmod +x "$scratch/pi"
 calls() { cat "$scratch/calls" 2>/dev/null | tr '\n' ' '; }
 applied() { cat "$HOME/.pi/agent/vibes-hotfix" 2>/dev/null; }
 
+# `vibes hotfix --help` prints usage and never reads or tags main.
+output=$(source scripts/vibes; gh() { echo "gh $*" >>"$scratch/gh"; }; main hotfix --help)
+check "hotfix --help: usage" '[ "$output" = "usage: vibes hotfix \"<what it fixes>\"" ]'
+check "hotfix --help: no GitHub call" '[ ! -e "$scratch/gh" ]'
+
 run
 check "no hotfix tags: nothing runs" '[ -z "$(calls)" ] && [ ! -e "$scratch/log" ]'
 
 (cd "$scratch/work" && hotfix hotfix-20260101-000000 "Fix the MCP login")
 run
-check "new hotfix: the narrow update runs migration once" '[ "$(calls)" = "packages rolling-packages surf settings mcp-before pi startup pi-1-migration " ]'
+check "new hotfix: the narrow update runs migration once" '[ "$(calls)" = "packages rolling-packages claude-code surf settings mcp-before pi startup pi-1-migration " ]'
 check "new hotfix: recorded" '[ "$(applied)" = hotfix-20260101-000000 ]'
 check "new hotfix: the user is told what it fixes" 'grep -q "Fix the MCP login. Restart Pi" "$HOME/.pi/agent/vibes-update.json"'
 rm -f "$scratch/calls"
@@ -68,7 +74,7 @@ check "Pi-moving hotfix while Pi runs: waits" '[ -z "$(calls)" ] && [ "$(applied
 check "Pi-moving hotfix while Pi runs: remembers it is waiting" '[ "$(cat "$HOME/.pi/agent/vibes-hotfix-waiting")" = hotfix-20260102-000000 ]'
 rm -f "$scratch/pi-running"
 run
-check "Pi closed: the hotfix installs" '[ "$(calls)" = "packages rolling-packages surf settings pi startup " ] && [ "$(applied)" = hotfix-20260102-000000 ]'
+check "Pi closed: the hotfix installs" '[ "$(calls)" = "packages rolling-packages claude-code surf settings pi startup " ] && [ "$(applied)" = hotfix-20260102-000000 ]'
 check "installed: no longer waiting" '[ ! -e "$HOME/.pi/agent/vibes-hotfix-waiting" ]'
 
 # A failed hotfix isn't recorded, so the next hour tries again, and Pi reports the failure.
@@ -81,7 +87,7 @@ check "failed hotfix: not recorded" '[ "$(applied)" = hotfix-20260102-000000 ]'
 check "failed hotfix: status says it failed" 'node -e "process.exit(JSON.parse(require(\"fs\").readFileSync(process.argv[1])).ok ? 1 : 0)" "$HOME/.pi/agent/vibes-update.json"'
 rm -f "$scratch/startup-fails" "$scratch/calls"
 run
-check "failed hotfix: retried and installed" '[ "$(calls)" = "packages rolling-packages surf settings pi startup " ] && [ "$(applied)" = hotfix-20260103-000000 ]'
+check "failed hotfix: retried and installed" '[ "$(calls)" = "packages rolling-packages claude-code surf settings pi startup " ] && [ "$(applied)" = hotfix-20260103-000000 ]'
 
 # A failed rolling refresh is retried on the next actual hotfix run.
 rm -f "$scratch/calls"
@@ -92,7 +98,7 @@ check "failed rolling refresh: not recorded" '[ "$(applied)" = hotfix-20260103-0
 check "failed rolling refresh: status reports failure" 'node -e "const s=require(process.argv[1]);process.exit(s.ok || !s.steps.some(x=>x.name===\"rolling-packages\" && !x.ok) ? 1 : 0)" "$HOME/.pi/agent/vibes-update.json"'
 rm -f "$scratch/rolling-fails" "$scratch/calls"
 run
-check "failed rolling refresh: retried" '[ "$(calls)" = "packages rolling-packages surf settings pi startup " ] && [ "$(applied)" = hotfix-20260104-000000 ]'
+check "failed rolling refresh: retried" '[ "$(calls)" = "packages rolling-packages claude-code surf settings pi startup " ] && [ "$(applied)" = hotfix-20260104-000000 ]'
 
 (cd "$scratch/work" && hotfix hotfix-20260105-000000 "Surf runtime")
 touch "$scratch/surf-fails"

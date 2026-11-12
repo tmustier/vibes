@@ -47,8 +47,11 @@ cp "$VIBES/scripts/inventory" "$VIBES/scripts/usage-telemetry"
 cp scripts/refresh "$VIBES/scripts/refresh"
 STATUS_FILE=$scratch/status NOTES_FILE=$scratch/notes LOG_FILE=$scratch/log
 VIBES_UPDATE_LOCKED=1 VIBES_UPDATE_CONTINUED=1 VIBES_UPDATE_PREVIOUS=$scratch/previous VIBES_UPDATE_RESULTS=$'packages\tok\t'
-for f in load_nvm refresh_rolling_packages update_surf sync_settings install_hotfix_job install_refresh_job update_repo cmd_check osascript; do eval "$f() { :; }"; done
+for f in load_nvm ensure_claude_code refresh_rolling_packages update_surf sync_settings install_update_job install_hotfix_job install_refresh_job install_chatgpt_job update_repo cmd_check osascript; do eval "$f() { :; }"; done
+# HOME is scratch here, so a job loaded into the real launchd session would point at a deleted folder.
+launchctl() { echo "$*" >>"$scratch/launchctl"; }
 cmd_update >/dev/null
+[ ! -e "$scratch/launchctl" ]
 expect install -g --prefix "$scratch/prefix" --before "$cutoff" @earendil-works/pi-coding-agent@1.2.0
 
 # The hotfix path also reaches the same real installer with the cutoff in the downloaded package.
@@ -68,5 +71,6 @@ log_output() { :; }
 cmd_hotfix_check >/dev/null
 expect install -g --prefix "$scratch/prefix" --before "$cutoff" @earendil-works/pi-coding-agent@1.2.0
 [ "$(cat "$HOTFIX_FILE")" = hotfix-test ]
+[ ! -e "$scratch/launchctl" ]
 
 echo 'ok: cutoff, existing prefix, no Pi wrapper, already-installed Pi, fresh install, nightly handover and hotfix'

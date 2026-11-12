@@ -25,7 +25,7 @@ REQUIRED = {
     "goal", "create-goal", "subagents", "wut", "paste", "code", "usage", "ysk",
     "browser-import", "browser-status", "browser-reset",
     "readfiles", "open", "voice-settings", "skill:chrome-cookies",
-    "skill:radius-api", "skill:ask-granola",
+    "skill:radius-api", "skill:ask-granola", "claude-code-status",
 }
 
 source = sys.argv[1] if len(sys.argv) > 1 else str(ROOT)

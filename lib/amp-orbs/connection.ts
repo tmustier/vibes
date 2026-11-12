@@ -126,7 +126,7 @@ export class ThreadConnection {
 			const archived = message === archivedError;
 			const failures = ++this.attempt;
 			if (archived) this.state.archive(); else this.state.disconnect(message, failures);
-			for (const pending of this.pending.values()) pending.reject(new Error("Amp disconnected; message acknowledgement unknown. Read status before retrying."));
+			for (const pending of this.pending.values()) pending.reject(new Error("Amp disconnected; message acknowledgement unknown."));
 			this.changed();
 			// Reconnect only after a transport failure, never poll idle work or an archived thread.
 			if (!archived) this.retry = setTimeout(() => this.start(), Math.min(30000, 1000 * 2 ** Math.min(failures - 1, 5)));
@@ -173,7 +173,7 @@ export class ThreadConnection {
 		this.state.assertCanSend();
 		const id = ++this.requestId;
 		const messageId = `M-${randomUUID().replaceAll("-", "").slice(0, 22)}`;
-		this.state.rearm();
+		this.state.rearm(messageId);
 		// Amp shows the label as "Message from Pi <id> plugin". agent-default (not a user rule): 2026-10-28. The last
 		// 8 characters of the session ID tell sessions apart; its start is a timestamp that sessions share.
 		const meta = { generatedByPlugin: `Pi ${sessionId.slice(-8)}` };
@@ -182,22 +182,25 @@ export class ThreadConnection {
 		const accepted = await new Promise<boolean>((resolve, reject) => {
 			this.pending.set(id, { resolve, reject });
 			const deadline = AbortSignal.any([AbortSignal.timeout(30000), ...(signal ? [signal] : [])]);
-			deadline.addEventListener("abort", () => reject(new Error("Amp acknowledgement not received; delivery may have occurred. Read status before retrying.")));
+			deadline.addEventListener("abort", () => reject(new Error("Amp acknowledgement not received; delivery may have occurred.")));
+		}).catch((error: Error) => {
+			throw new Error(`${error.message} Message ${messageId}: read get_thread_status before retrying; sent.delivery becomes "accepted" once the thread has it.`);
 		}).finally(() => this.pending.delete(id));
 		if (!accepted) {
 			// Nothing was appended. Restore settling and read a fresh snapshot; never retry the write.
-			this.state.cancelRearm();
+			this.state.cancelRearm(messageId);
 			this.start();
 			throw new Error("Amp rejected the message");
 		}
+		this.state.accept(messageId);
 		return { accepted, messageId };
 	}
 }
 
 export type PiSender = { sessionId: string; opening: boolean };
-function piContent(text: string, { sessionId, opening }: PiSender) {
+function piContent(text: string, { sessionId, opening }: PiSender, hidden = true) {
 	const note = `\n\nThread message metadata: this message was sent by Pi session \`${sessionId}\`, an agent on the user's computer, not directly by the user.${opening ? "" : " Start acting on it without first replying to it in text."} Unless you delegated the work to it, do not add its changes to your work without the user's approval. Pi watches this thread and reads your final response, so include the outcome and anything Pi must decide or act on there.`;
-	return [{ type: "text", text }, { type: "text", text: note, hidden: true }];
+	return [{ type: "text", text }, { type: "text", text: note, hidden }];
 }
 type LaunchOptions = { cwd: string; mode: string; prompt: string; title?: string; project?: string; features?: string[]; sessionId: string };
 /**
@@ -215,7 +218,8 @@ export async function launch({ cwd, mode, prompt, title, project, features = [],
 		});
 	const params = {
 		agentMode: mode, features, projectID, executeMode: true, title,
-		content: mode.startsWith("external-agent:") ? piContent(prompt, { sessionId, opening: true })
+		// External agents keep only the visible text of a thread's first message.
+		content: mode.startsWith("external-agent:") ? piContent(prompt, { sessionId, opening: true }, false)
 			: [{ type: "text", text: `Pi session \`${sessionId}\` is starting this thread. Its first message follows immediately; do not reply to this one.`, hidden: true }],
 		userState: { currentlyVisibleFiles: [], timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone },
 		threadMeta: { visibility: "thread_workspace_shared" },

@@ -2,7 +2,7 @@
 # vibes: keep this Mac on the team's Pi setup.
 #
 #   vibes update   Homebrew formulae, nvm, Node (.node-version), npm, the Vibes packages, the team's
-#                  model, compaction and subagent settings, the pinned Pi version, and
+#                  model, compaction and subagent settings, the pinned Pi version, the model registry, and
 #                  startup checks. The home command uses scripts/home-update instead. Packages the user
 #                  installed themselves, and settings they changed, are left alone. Ends with `vibes check`,
 #                  then sends the setup inventory only to an explicitly configured destination. On the first Pi 1.0
@@ -18,6 +18,10 @@
 #                  switched on, the context breakdown, and the text of the user's own skills, prompts and
 #                  extensions, with credentials removed (scripts/inventory).
 #   vibes status   Show the result of the last update.
+#   vibes chatgpt-update [--status]
+#                  Stage native updates daily and enforce Saturdays at 04:00 local, with offline catch-up.
+#   vibes install-jobs  Load the nightly update, refresh, ChatGPT and hotfix launchd jobs, creating missing ones.
+#                  Explicit opt-in: neither Pi startup nor the home command runs it.
 #   vibes features [migrate [--apply] [--source <source>]]
 #                  List personal feature choices, or explicitly migrate exact wrapper opt-outs with backups.
 #   vibes hotfix <what it fixes>
@@ -47,10 +51,13 @@ NOTES_FILE="$AGENT_DIR/vibes-update-notes" # one per line, until write_status ta
 LOCK_FILE="$AGENT_DIR/vibes-update.flock"
 LOG_FILE="$HOME/Library/Logs/pi-update.log"
 HOTFIX_FILE="$AGENT_DIR/vibes-hotfix" # the last hotfix tag this Mac has
+UPDATE_LABEL=ai.vibes.pi-update
 HOTFIX_LABEL=ai.vibes.pi-hotfix
 HOTFIX_INTERVAL_SECONDS=3600 # agent-default (not a user rule): 2026-09-29
 REFRESH_LABEL=ai.vibes.pi-refresh
 REFRESH_INTERVAL_SECONDS=3600 # agent-default (not a user rule): 2026-10-14
+CHATGPT_LABEL=ai.vibes.chatgpt-update
+CHATGPT_INTERVAL_SECONDS=300 # agent-default (not a user rule): 2026-11-04, retry and warning ticks
 LAUNCH_AGENTS="$HOME/Library/LaunchAgents"
 VIBES_REPO=tmustier/vibes
 AGENT_TIMEOUT_SECONDS=1800 # agent-default (not a user rule): 2026-09-28
@@ -138,6 +145,13 @@ update_vibes_packages() {
 	return $failed
 }
 
+# Refresh catalogs without updating Pi itself or the user's installed packages.
+update_models() {
+	local pi
+	pi=$(pi_bin) || { echo "Pi isn't installed"; return 1; }
+	(cd "$HOME" && "$pi" update --models)
+}
+
 # Pi skips dependency installation when the Vibes Git commit hasn't changed, and npm otherwise
 # uses the checked-in lock snapshot. Refresh only the two owned rolling defaults explicitly.
 # --no-save keeps both manifests intact; leave the lock enabled for every other dependency.
@@ -145,6 +159,34 @@ refresh_rolling_packages() {
 	(cd "$VIBES" && npm install --no-save --omit=dev codex-computer-use-mcp@latest @tmustier/pi-session-hud@latest)
 }
 
+# Native updates stage daily and enforce Saturday 04:00 local, with durable offline catch-up.
+# Sparkle handles quit/relaunch. Homebrew is used only for a missing initial installation.
+# launchd starts the job with the system PATH only, which has no Homebrew: add it for `brew install`.
+update_chatgpt() { PATH="$PATH:/opt/homebrew/bin:/usr/local/bin" python3 "$VIBES/scripts/chatgpt-update" "$@"; }
+
+# Its own short ticks keep retries and advance warnings independent of full Pi updates.
+install_chatgpt_job() {
+	local plist="$LAUNCH_AGENTS/$CHATGPT_LABEL.plist" new loaded=""
+	new=$(python3 - "$HOME/.local/bin/vibes" "$LOG_FILE" "$CHATGPT_LABEL" "$CHATGPT_INTERVAL_SECONDS" <<'PY'
+import plistlib, sys
+command, log, label, interval = sys.argv[1:]
+print(plistlib.dumps({"Label": label, "ProgramArguments": [command, "chatgpt-update"],
+    "RunAtLoad": True, "StartInterval": int(interval),
+    "StartCalendarInterval": [{"Weekday": 6, "Hour": 3, "Minute": 50},
+                              {"Weekday": 6, "Hour": 4, "Minute": 0}],
+    "StandardOutPath": log, "StandardErrorPath": log}).decode(), end="")
+PY
+) || return 1
+	launchctl print "gui/$(id -u)/$CHATGPT_LABEL" >/dev/null 2>&1 && loaded=1
+	[ "$(cat "$plist" 2>/dev/null)" != "$new" ] || [ -z "$loaded" ] || return 0
+	mkdir -p "$LAUNCH_AGENTS" "$(dirname "$LOG_FILE")" && printf '%s\n' "$new" >"$plist" || return 1
+	[ -z "$loaded" ] || launchctl bootout "gui/$(id -u)/$CHATGPT_LABEL" >/dev/null 2>&1
+	launchctl enable "gui/$(id -u)/$CHATGPT_LABEL" && launchctl bootstrap "gui/$(id -u)" "$plist"
+}
+
+online() { curl -fsS --max-time 10 -o /dev/null https://github.com; }
+
+ensure_claude_code() { node "$VIBES/scripts/ensure-claude-code.mjs"; }
 update_surf() { node "$VIBES/scripts/surf-runtime.mjs" update; }
 check_surf() { node "$VIBES/scripts/surf-runtime.mjs" check; }
 
@@ -204,6 +246,33 @@ latest_hotfix() {
 
 # Whether a Pi session is running (Pi names its process `pi`).
 pi_running() { pgrep -x pi >/dev/null; }
+
+# The nightly job that runs `vibes update`. Create the job when it is missing and load it when it
+# isn't loaded, but never rewrite an existing plist, which may carry the user's own settings
+# (such as EnvironmentVariables).
+install_update_job() {
+	local plist="$LAUNCH_AGENTS/$UPDATE_LABEL.plist"
+	if [ ! -f "$plist" ]; then
+		mkdir -p "$LAUNCH_AGENTS" && python3 - "$HOME/.local/bin/vibes" "$LOG_FILE" "$UPDATE_LABEL" >"$plist" <<'PY' || return 1
+import plistlib, sys
+command, log, label = sys.argv[1:]
+print(plistlib.dumps({"Label": label, "ProgramArguments": [command, "update"],
+    "StartCalendarInterval": {"Hour": 4, "Minute": 4},
+    "StandardOutPath": log, "StandardErrorPath": log}).decode(), end="")
+PY
+	fi
+	# A disabled job can't be loaded until it is enabled again, and launchd remembers that across restarts.
+	launchctl print "gui/$(id -u)/$UPDATE_LABEL" >/dev/null 2>&1 ||
+		{ launchctl enable "gui/$(id -u)/$UPDATE_LABEL" && launchctl bootstrap "gui/$(id -u)" "$plist"; }
+}
+
+# Opt in to the managed jobs: the `vibes` command the jobs call, and the jobs. Loading the refresh
+# job starts an overdue update straight away.
+cmd_install_jobs() {
+	mkdir -p "$HOME/.local/bin" || return 1
+	[ -e "$HOME/.local/bin/vibes" ] || ln -s "$VIBES/scripts/vibes" "$HOME/.local/bin/vibes" || return 1
+	install_update_job && install_hotfix_job && install_refresh_job && install_chatgpt_job
+}
 
 # The hourly launchd job that runs `vibes hotfix-check`. Rewritten and reloaded only when it changed.
 install_hotfix_job() {
@@ -307,6 +376,7 @@ cmd_hotfix_check() {
 	[ ! -f "$VIBES/models.template.json" ] || cp "$VIBES/models.template.json" "$previous/"
 	step packages update_vibes_packages
 	step rolling-packages refresh_rolling_packages
+	step claude-code ensure_claude_code
 	step surf update_surf
 	step settings sync_settings "$previous"
 	rm -rf "$previous"
@@ -335,6 +405,7 @@ cmd_hotfix_check() {
 # Maintainers: tag Vibes main as a hotfix, once CI has passed on it.
 cmd_hotfix() {
 	local message=$1 sha subject checks tag object answer
+	case $message in -h|--help) echo 'usage: vibes hotfix "<what it fixes>"'; return 0 ;; esac
 	[ -n "$message" ] || { echo 'usage: vibes hotfix "<what it fixes>"'; return 2; }
 	sha=$(gh api "repos/$VIBES_REPO/commits/main" --jq .sha) && subject=$(gh api "repos/$VIBES_REPO/commits/$sha" --jq '.commit.message | split("\n")[0]') || return 1
 	checks=$(gh api "repos/$VIBES_REPO/commits/$sha/check-runs" --jq '[.check_runs[] | "\(.name): \(.conclusion // .status)"] | join(", ")') || return 1
@@ -676,6 +747,7 @@ check_gog_keyring() {
 
 cmd_check() {
 	local dir=$1 scratch screen="" previous="" stable=0 problems surf_status=0
+	case $dir in -h|--help) echo 'usage: vibes check [dir]'; return 0 ;; esac
 	check_gog_keyring
 	check_surf || surf_status=$?
 	command -v tmux >/dev/null || { echo "vibes check needs tmux: brew install tmux"; return 1; }
@@ -805,6 +877,12 @@ cmd_update() {
 		export NVM_DIR="$HOME/.nvm"
 		export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 		echo "=== $(date '+%Y-%m-%d %H:%M:%S') vibes update"
+		# Offline: keep the last result and let the hourly refresh retry, rather than record
+		# failures and have Pi try to repair a network outage.
+		if ! online; then
+			echo "offline; vibes refresh retries hourly"
+			return 75
+		fi
 		python3 "$VIBES/scripts/refresh" begin-update || return 1
 
 		step homebrew update_brew
@@ -832,14 +910,18 @@ cmd_update() {
 	previous=$VIBES_UPDATE_PREVIOUS
 	while IFS= read -r row; do [ -z "$row" ] || RESULTS+=("$row"); done <<<"$VIBES_UPDATE_RESULTS"
 	unset VIBES_UPDATE_RESULTS VIBES_UPDATE_PREVIOUS
+	step claude-code ensure_claude_code
 	step rolling-packages refresh_rolling_packages
 	step surf update_surf
 	step settings sync_settings "$previous"
 	rm -rf "$previous"
 	! pi_1_migration_needed || step mcp-before capture_pi_1_baseline
 	step pi install_pinned_pi
+	step models update_models
+	step update-job install_update_job
 	step hotfix-job install_hotfix_job
 	step refresh-job install_refresh_job
+	step chatgpt-job install_chatgpt_job
 	INVENTORY=$(mktemp)
 	step startup cmd_check
 	! pi_1_migration_needed || step pi-1-migration run_pi_1_migration
@@ -894,8 +976,10 @@ main() {
 	case "${1:-}" in
 	update) cmd_update ;;
 	refresh) cmd_refresh ;;
+	chatgpt-update) shift; update_chatgpt "$@" ;;
 	usage) shift; "$VIBES/scripts/usage-telemetry" "${@:-collect}" ;;
 	status) cmd_status ;;
+	install-jobs) cmd_install_jobs ;;
 	features) shift; node "$VIBES/scripts/features.mjs" "$@" ;;
 	check) cmd_check "${2:-}" ;;
 	surf-setup) shift; mkdir -p "$(dirname "$LOCK_FILE")" && with_lock node "$VIBES/scripts/surf-runtime.mjs" setup "$@" ;;
@@ -908,7 +992,7 @@ main() {
 		cmd_check >&2 && "$VIBES/scripts/inventory" show "$INVENTORY"
 	) ;;
 	*)
-		echo "usage: vibes update | vibes refresh | vibes usage [collect|send] | vibes check [dir] | vibes surf-setup [extension-id] | vibes inventory | vibes status | vibes features [migrate [--apply] [--source <source>]] | vibes report <session.jsonl> <summary> | vibes hotfix <what it fixes> | vibes hotfix-check"
+		echo "usage: vibes update | vibes refresh | vibes chatgpt-update [--status] | vibes usage [collect|send] | vibes check [dir] | vibes surf-setup [extension-id] | vibes inventory | vibes status | vibes install-jobs | vibes features [migrate [--apply] [--source <source>]] | vibes report <session.jsonl> <summary> | vibes hotfix <what it fixes> | vibes hotfix-check"
 		return 2
 		;;
 	esac

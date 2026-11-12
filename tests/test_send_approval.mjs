@@ -1,6 +1,12 @@
 // Every native or legacy adapter MCP email send asks individually; headless calls are denied.
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import sendApproval from "../extensions/send-approval.ts";
+
+// The wrapper reads feature choices from the agent directory; keep the host's out of the test.
+process.env.PI_CODING_AGENT_DIR = mkdtempSync(join(tmpdir(), "vibes-send-approval-"));
 
 const start = (hasUI, answers = []) => {
 	const handlers = {};
@@ -38,4 +44,5 @@ assert.equal(await session.native("mcp__superhuman-mail__create_or_update_draft"
 assert.equal(await session.adapter("create_or_update_draft"), "not claimed");
 assert.equal((await start(false).native("mcp__superhuman-mail__send_draft")).block, true);
 assert.equal(await start(false).adapter("send_draft"), "deny");
+rmSync(process.env.PI_CODING_AGENT_DIR, { recursive: true });
 console.log("ok");

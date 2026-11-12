@@ -411,7 +411,7 @@ test("external-agent launch includes the literal task and Pi attribution at crea
 	assert.deepEqual(params.features, features);
 	const [task, note] = params.content;
 	assert.deepEqual(task, { type: "text", text: prompt }, "external agents need a visible prompt in the creation request");
-	assert(note.hidden && note.text.includes(`Pi session \`${sessionId}\``));
+	assert(!note.hidden && note.text.includes(`Pi session \`${sessionId}\``), "external agents drop hidden opening text, so the Pi note is visible");
 	assert(note.text.includes("not directly by the user") && note.text.includes("Pi watches this thread"));
 	assert(!note.text.includes("Start acting"), "the opening note is not follow-up steering");
 });

@@ -26,6 +26,11 @@ try {
 	assert.match(cli(), /claude-artifacts: on \(default\)/);
 	fs.writeFileSync(configPath, JSON.stringify({ features: { "claude-artifacts": false } }));
 	assert.match(cli(), /claude-artifacts: off \(personal\)/);
+	fs.writeFileSync(configPath, JSON.stringify(config));
+	assert.match(cli(), /claude-code: on \(default\)/);
+	fs.writeFileSync(configPath, JSON.stringify({ features: { "claude-code": false } }));
+	assert.match(cli(), /claude-code: off \(personal\)/);
+	fs.writeFileSync(configPath, JSON.stringify(config));
 	assert.match(cli(), /anthropic-gzip: on \(default\)/);
 	fs.writeFileSync(configPath, JSON.stringify({ features: { "anthropic-gzip": false } }));
 	assert.match(cli(), /anthropic-gzip: off \(personal\)/);
@@ -73,7 +78,28 @@ try {
 		assert.notEqual(invalid.status, 0);
 		assert.match(invalid.stderr, message);
 	}
-	console.log("ok: CLI preview/apply, preserved settings and copies, backups, conflicts, invalid config and idempotence");
+	// The updater installs the CLI only for enabled users without an existing command.
+	const bin = path.join(scratch, "bin");
+	fs.mkdirSync(bin);
+	const installed = path.join(scratch, "installed");
+	fs.writeFileSync(path.join(bin, "npm"), '#!/bin/bash\nprintf "%s\\n" "$*" > "$INSTALL_PROOF"\n', { mode: 0o755 });
+	const setup = () => spawnSync(process.execPath, [path.join(root, "scripts/ensure-claude-code.mjs")], {
+		env: { ...env, PATH: `${bin}:/usr/bin:/bin`, PI_CLAUDE_CODE_COMMAND: "", INSTALL_PROOF: installed }, encoding: "utf8",
+	});
+	fs.writeFileSync(configPath, JSON.stringify({ features: { "claude-code": false } }));
+	assert.equal(setup().status, 0);
+	assert.equal(fs.existsSync(installed), false, "disabled users do not install Claude Code");
+	fs.writeFileSync(configPath, "{}");
+	assert.equal(setup().status, 0);
+	assert.equal(fs.readFileSync(installed, "utf8").trim(), "install -g @anthropic-ai/claude-code");
+	fs.rmSync(installed);
+	fs.writeFileSync(path.join(bin, "claude"), "#!/bin/bash\nexit 0\n", { mode: 0o755 });
+	assert.equal(setup().status, 0);
+	assert.equal(fs.existsSync(installed), false, "existing Claude Code installations stay untouched");
+	fs.rmSync(path.join(bin, "claude"));
+	fs.writeFileSync(path.join(bin, "npm"), "#!/bin/bash\nexit 7\n", { mode: 0o755 });
+	assert.equal(setup().status, 7, "installation failures reach the update result");
+	console.log("ok: feature choices, migration and Claude Code prerequisite installation");
 } finally {
 	fs.rmSync(scratch, { recursive: true, force: true });
 }

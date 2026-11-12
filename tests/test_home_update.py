@@ -53,7 +53,7 @@ nvm() {
         pinned_pi = json.loads((ROOT / "package.json").read_text())["devDependencies"]["@earendil-works/pi-coding-agent"]
         for name, content in {
             "npm": '#!/bin/bash\nprintf "npm %s node=%s\\n" "$*" "$TEST_NODE_SELECTED" >>"$TEST_TRACE"\nexit "${TEST_PACKAGES_EXIT:-0}"\n',
-            "pi": f'#!/bin/bash\nprintf "{pinned_pi}\\n"\n',
+            "pi": f'#!/bin/bash\n[ "$1" = --version ] || printf "pi %s cwd=%s\\n" "$*" "$PWD" >>"$TEST_TRACE"\nprintf "{pinned_pi}\\n"\n',
             "launchctl": '#!/bin/bash\nexit 1\n',
         }.items():
             path = self.bin / name
@@ -79,6 +79,10 @@ nvm() {
         (seed / "scripts/surf-runtime.mjs").write_text(
             'import { appendFileSync } from "node:fs";\n'
             'appendFileSync(process.env.PI_CODING_AGENT_DIR + "/vibes-update-notes", "Surf was updated.\\n");\n')
+        # The real script may install Claude Code; this one records that it ran.
+        (seed / "scripts/ensure-claude-code.mjs").write_text(
+            'import { writeFileSync } from "node:fs";\n'
+            'writeFileSync(process.env.PI_CODING_AGENT_DIR + "/claude-code-proof", "ok");\n')
         for name in (".node-version", "package.json", "settings.template.json", "subagent-config.template.json", "web-search.template.json"):
             shutil.copy2(ROOT / name, seed / name)
         self.git(seed, "init", "-q", "-b", "main")
@@ -114,6 +118,12 @@ nvm() {
         self.assertEqual((self.agent / "sync-proof").read_text(), "ok")
         names = [step["name"] for step in status["steps"]]
         self.assertLess(names.index("packages"), names.index("surf"))
+        self.assertLess(names.index("packages"), names.index("claude-code"))
+        self.assertEqual((self.agent / "claude-code-proof").read_text(), "ok")
+        # Only the model registry is refreshed, from HOME rather than the checkout, once Pi is pinned.
+        self.assertLess(names.index("pi"), names.index("models"))
+        self.assertLess(names.index("models"), names.index("startup"))
+        self.assertIn(f"pi update --models cwd={self.home}", (self.root / "trace").read_text().splitlines())
         self.assertEqual(status["notes"], ["Surf was updated."])
         self.assertFalse((self.agent / "vibes-update-notes").exists())
         self.assertEqual(self.git(self.repo, "status", "--porcelain"), "")
