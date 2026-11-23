@@ -12,7 +12,10 @@ fi
 
 # Inline grey autosuggestions as you type, from shell history and
 # tab-completion candidates. Accept with the right arrow key.
-if [ -r /opt/homebrew/share/zsh-autosuggestions/zsh-autosuggestions.zsh ]; then
+# Skipped if ~/.zshrc already loaded it: sourcing it twice breaks its widgets.
+if typeset -f _zsh_autosuggest_start >/dev/null 2>&1; then
+  :
+elif [ -r /opt/homebrew/share/zsh-autosuggestions/zsh-autosuggestions.zsh ]; then
   source /opt/homebrew/share/zsh-autosuggestions/zsh-autosuggestions.zsh
 elif [ -r /usr/local/share/zsh-autosuggestions/zsh-autosuggestions.zsh ]; then
   source /usr/local/share/zsh-autosuggestions/zsh-autosuggestions.zsh
