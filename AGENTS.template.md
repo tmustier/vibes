@@ -28,7 +28,7 @@ Use this template only if you want it. Personal onboarding preserves an existing
 
 - Check `git status` and fetch before changing anything. Never pull or rebase over a dirty tree.
 - Before editing a shared repository, work in a fresh task-specific worktree or clone, and commit there. Do not switch branches in a checkout someone else may be using.
-- Prefer a focused branch and PR over pushing to shared branches. Follow stricter repository instructions when present.
+- Follow the repository's own rules for branches and pull requests. Where a repository has no rule, prefer a focused branch and PR over pushing to shared branches.
 - Read full files before editing. Write decisive code: prefer clear invariants over defensive branches and tests for impossible states. Every regression test must fail against the bug.
 - Commit with the user's GitHub identity and a clear message, and push completed work (within the authority above) so it isn't stranded. For visible changes, attach screenshots or a short video to the PR with `gh … --attach` (GitHub CLI 2.99 or later).
 - Never leave conflicts or uncommitted changes from your work. When the user asks whether work is saved, check `git status` and `git log` and answer in plain English.
