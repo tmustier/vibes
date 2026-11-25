@@ -11,7 +11,7 @@
     "test:browser": "node --experimental-strip-types --test packages/pi-browser/index.test.ts && uv run packages/pi-browser/test_import_chrome_cookies.py"
   },
   "dependencies": {
-    "@earendil-works/pi-claude-code": "git+https://github.com/earendil-works/pi-claude-code.git#d5b5e04c314d3452d357174d16d10dda34daa2d2",
+    "@earendil-works/pi-claude-code": "git+https://github.com/scottmonster/pi-claude-code.git#07d28c6b3b7855d973bdc07895f2456fc66fd1d9",
     "@earendil-works/pi-radius": "0.1.19",
     "@earendil-works/pi-voice": "0.2.0",
     "@howaboua/pi-codex-imagegen": "0.0.16",
