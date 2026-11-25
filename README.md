@@ -46,6 +46,10 @@ Vibes bundles [pi-claude-code](https://github.com/earendil-works/pi-claude-code)
 
 Set `"claude-code": false` in your feature choices to disable the provider and skip the CLI installation.
 
+## Terminal browser
+
+[terminal-browser](https://terminal-browser.com/) shows a live website beside your conversation in cmux, Ghostty, Rex and other supported terminals. Ask Pi to open a page beside you, or run `terminal-browser open https://example.com --split right`. Pi reads and drives the page with the `terminal-browser` skill the CLI installs in `~/.agents/skills`. `vibes update` installs it with Homebrew when it is missing and upgrades Homebrew copies; an installation from elsewhere stays as it is (`terminal-browser upgrade` updates it).
+
 ## Idle parking
 
 Parking is optional and needs the launcher as well as the extension. To enable it, add this alias to `~/.zshrc`, adjusting the path if your clone lives elsewhere:
@@ -66,9 +70,9 @@ The home updater writes `~/.pi/agent/vibes-update.json` with `updater: "home"`, 
 
 `vibes check` starts Pi in a hidden tmux session. Behaviour changes also need a real prompt and tool call. If Granola times out despite a valid login, see the [compatibility fix](docs/granola-mcp.md).
 
-### Codex Notes migration
+### Realtime voice
 
-Codex Conversion 4.0.5 removes its built-in Notes/history and legacy Remote mode. Existing Notes configurations can block turns, including in voice-only mode. Follow the upgrade message: install and enable `@howaboua/pi-notes-compaction`, or explicitly choose ordinary compaction in the indicated configuration file. The updater does not make that choice for you.
+**Ctrl+Alt+Space** starts realtime voice from [GipPity Control](https://github.com/IgorWarzocha/howaboua-pi-stuff/tree/main/packages/pi-gippity-control), and `/gippity` changes its settings and audio devices. It replaced Codex Conversion's voice-only mode, which Conversion 5.1.0 removed; `vibes update` copies your old voice settings across once. Pi receives a rewrite of what you said rather than the transcript, so Vibes has the rewrite done by `openai-codex/gpt-6.1-sol` at `medium` unless you choose another model. [Realtime voice](docs/realtime-voice.md) explains why.
 
 ## Privacy
 

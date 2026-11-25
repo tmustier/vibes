@@ -55,6 +55,9 @@ nvm() {
             "npm": '#!/bin/bash\nprintf "npm %s node=%s\\n" "$*" "$TEST_NODE_SELECTED" >>"$TEST_TRACE"\nexit "${TEST_PACKAGES_EXIT:-0}"\n',
             "pi": f'#!/bin/bash\n[ "$1" = --version ] || printf "pi %s cwd=%s\\n" "$*" "$PWD" >>"$TEST_TRACE"\nprintf "{pinned_pi}\\n"\n',
             "launchctl": '#!/bin/bash\nexit 1\n',
+            # Homebrew without the cask, and a terminal-browser installed some other way.
+            "brew": '#!/bin/bash\nprintf "brew %s\\n" "$*" >>"$TEST_TRACE"\n[ "$1" != list ]\n',
+            "terminal-browser": '#!/bin/bash\nprintf "terminal-browser %s\\n" "$*" >>"$TEST_TRACE"\n',
         }.items():
             path = self.bin / name
             path.write_text(content)
@@ -73,8 +76,9 @@ nvm() {
         for path in (seed / "scripts").iterdir():
             path.chmod(0o755)
         (seed / "scripts/sync-settings.mjs").write_text(
-            'import { writeFileSync } from "node:fs";\n'
-            'writeFileSync(process.argv[4] + "/sync-proof", "ok");\n')
+            'import { readdirSync, writeFileSync } from "node:fs";\n'
+            'writeFileSync(process.argv[4] + "/sync-proof", "ok");\n'
+            'writeFileSync(process.argv[4] + "/previous-templates", readdirSync(process.argv[2]).sort().join("\\n"));\n')
         # The real script needs Surf installed; this one records that it ran and leaves a note.
         (seed / "scripts/surf-runtime.mjs").write_text(
             'import { appendFileSync } from "node:fs";\n'
@@ -83,7 +87,7 @@ nvm() {
         (seed / "scripts/ensure-claude-code.mjs").write_text(
             'import { writeFileSync } from "node:fs";\n'
             'writeFileSync(process.env.PI_CODING_AGENT_DIR + "/claude-code-proof", "ok");\n')
-        for name in (".node-version", "package.json", "settings.template.json", "subagent-config.template.json", "web-search.template.json"):
+        for name in (".node-version", "package.json", "settings.template.json", "subagent-config.template.json", "web-search.template.json", "pi-gippity-control.template.json"):
             shutil.copy2(ROOT / name, seed / name)
         self.git(seed, "init", "-q", "-b", "main")
         self.git(seed, "config", "user.name", "Vibes test fixture")
@@ -116,6 +120,8 @@ nvm() {
         self.assertNotIn("agentsTemplateHash", status)
         self.assertEqual(self.file.stat().st_mode & 0o777, 0o600)
         self.assertEqual((self.agent / "sync-proof").read_text(), "ok")
+        # The templates from before the update, so a voice delegation model the user chose stays theirs.
+        self.assertIn("pi-gippity-control.template.json", (self.agent / "previous-templates").read_text().splitlines())
         names = [step["name"] for step in status["steps"]]
         self.assertLess(names.index("packages"), names.index("surf"))
         self.assertLess(names.index("packages"), names.index("claude-code"))
@@ -124,6 +130,12 @@ nvm() {
         self.assertLess(names.index("pi"), names.index("models"))
         self.assertLess(names.index("models"), names.index("startup"))
         self.assertIn(f"pi update --models cwd={self.home}", (self.root / "trace").read_text().splitlines())
+        # terminal-browser is checked after Pi's own updates; an installation from elsewhere stays.
+        self.assertLess(names.index("models"), names.index("terminal-browser"))
+        self.assertLess(names.index("terminal-browser"), names.index("startup"))
+        trace = (self.root / "trace").read_text().splitlines()
+        self.assertIn("terminal-browser --version", trace)
+        self.assertEqual([line for line in trace if line.startswith("brew")], ["brew list --cask terminal-browser"])
         self.assertEqual(status["notes"], ["Surf was updated."])
         self.assertFalse((self.agent / "vibes-update-notes").exists())
         self.assertEqual(self.git(self.repo, "status", "--porcelain"), "")

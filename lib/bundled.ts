@@ -37,6 +37,11 @@ type Bundle = {
 	/** Skill and prompt paths inside the package. */
 	skills?: string[];
 	prompts?: string[];
+	/**
+	 * Other packages that already include this one. When the user loads extensions from one of
+	 * them, the wrapper steps aside. That package is the user's choice, not a duplicate to migrate.
+	 */
+	includedIn?: string[];
 } & ({ noExtensions: true; entry?: never } | { noExtensions?: false; entry?: string });
 
 /** What the user's own copy of a package loads: files relative to the package, by kind. */
@@ -66,19 +71,20 @@ const readJson = (path: string): Manifest => JSON.parse(readFileSync(path, "utf8
 /**
  * The user's own copies of packages, by npm name: global settings, plus project settings when
  * trusted. Pi's package manager applies each entry's filters exactly as it will at
- * startup.
+ * startup. By default it looks for Vibes' bundled packages; `including` looks for those instead.
  */
-function userCopies(cwd: string, trusted: boolean, pass: LoadPass, discovery?: ExtensionContext): Promise<Map<string, Copy>> {
+function userCopies(cwd: string, trusted: boolean, pass: LoadPass, discovery?: ExtensionContext, including?: string[]): Promise<Map<string, Copy>> {
 	if (!pass.projects.has(cwd)) {
 		pass.projects.set(cwd, (SettingsManager.create(cwd, getAgentDir(), { projectTrusted: true }).getProjectSettings().packages?.length ?? 0) > 0);
 	}
 	trusted &&= pass.projects.get(cwd)!;
 	// Trusted project packages may be installed after factories run. Recheck once per discovery
 	// event; otherwise reuse the load result, including across session_start.
-	const key = trusted && discovery ? discovery : JSON.stringify([cwd, trusted]);
+	const key = trusted && discovery && !including ? discovery : JSON.stringify([cwd, trusted, including ?? []]);
 	const cached = pass.copies.get(key);
 	if (cached) return cached;
 	const bundleNames = Object.keys(readJson(join(nodeModules, "..", "package.json")).dependencies ?? {});
+	const wanted = including ?? bundleNames;
 	const agentDir = getAgentDir();
 	const settingsManager = SettingsManager.create(cwd, agentDir, { projectTrusted: trusted });
 	const packageManager = packageInspector({ cwd, agentDir, settingsManager });
@@ -121,7 +127,7 @@ function userCopies(cwd: string, trusted: boolean, pass: LoadPass, discovery?: E
 		const installed = packageManager.getInstalledPath(source, scope);
 		if (!installed) continue;
 		const root = statSync(installed).isDirectory() ? installed : dirname(installed);
-		if (bundleNames.includes(nameOf(root))) relevant.add(packageManager.getPackageIdentity(source, scope));
+		if (wanted.includes(nameOf(root))) relevant.add(packageManager.getPackageIdentity(source, scope));
 	}
 	const selected = packageManager.dedupePackages(sources).filter(({ source, scope }) =>
 		relevant.has(packageManager.getPackageIdentity(source, scope)),
@@ -129,6 +135,7 @@ function userCopies(cwd: string, trusted: boolean, pass: LoadPass, discovery?: E
 	const accumulator = packageManager.createAccumulator();
 	const pending = packageManager.resolvePackageSources(selected, accumulator, async () => "skip").then(() => {
 		record(packageManager.toResolvedPaths(accumulator));
+		if (including) return copies;
 
 		// A missing project package loads what its filter selects once Pi installs it. Vibes' own copy
 		// of the same package stands in for it.
@@ -256,9 +263,11 @@ export function bundled(source: string, bundle: Bundle): Factory {
 		}
 		const covers = async (projectTrusted: boolean) => {
 			const copy = (await userCopies(cwd, projectTrusted, pass)).get(bundle.package);
-			if (!copy?.extensions.size) return false;
 			const entry = bundle.entry && join(bundle.entry);
-			return !entry || [...copy.extensions].some((file) => file === entry || file.startsWith(`${entry}/`));
+			if (copy?.extensions.size && (!entry || [...copy.extensions].some((file) => file === entry || file.startsWith(`${entry}/`)))) return true;
+			if (!bundle.includedIn) return false;
+			const including = await userCopies(cwd, projectTrusted, pass, undefined, bundle.includedIn);
+			return bundle.includedIn.some((name) => (including.get(name)?.extensions.size ?? 0) > 0);
 		};
 		// Until Pi decides, assume it will trust the folder: loading both copies would stop Pi.
 		state.steppedAside = await covers(trusted ?? true);

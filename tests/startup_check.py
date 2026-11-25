@@ -19,7 +19,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 REQUIRED = {
     "onboard", "mcp", "search", "computer-use-status", "fast", "hud",
-    "contextimate", "drill", "codex", "read-agent-instructions:stats",
+    "contextimate", "drill", "gippity", "read-agent-instructions:stats",
     "papercuts-review", "do-less", "skill:bro", "skill:surf", "skill:extending-pi", "skill:google-workspace-stack",
     "skill:linkedin-lookup", "skill:unslop", "skill:visual-verify", "skill:tmux",
     "goal", "create-goal", "subagents", "wut", "paste", "code", "usage", "ysk",

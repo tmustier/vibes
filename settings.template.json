@@ -21,6 +21,12 @@
       ]
     },
     {
+      "source": "git:github.com/typesafe-ai/skills",
+      "skills": [
+        "skills/typesafe-ai/SKILL.md"
+      ]
+    },
+    {
       "source": "git:github.com/tmustier/vibes"
     }
   ],

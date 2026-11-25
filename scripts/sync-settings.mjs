@@ -12,6 +12,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import { patchRadiusWork } from "../lib/cache-safe-radius-work.mjs";
+import { migrateVoiceSettings } from "./migrate-voice-settings.mjs";
 
 const SETTINGS_KEYS = [
 	"enabledModels",
@@ -28,8 +29,10 @@ const [previousDir, vibesDir, agentDir] = process.argv.slice(2);
 
 const read = (path) => (existsSync(path) ? JSON.parse(readFileSync(path, "utf8")) : {});
 
-function sync(template, targetPath, keys = null, section = null) {
-	let previousRoot = read(join(previousDir, template));
+// `before` stands in for the previous template on the update that first ships one.
+function sync(template, targetPath, keys = null, section = null, before = {}) {
+	const previousPath = join(previousDir, template);
+	let previousRoot = existsSync(previousPath) ? read(previousPath) : before;
 	let nextRoot = read(join(vibesDir, template));
 	const targetRoot = read(targetPath);
 	if (template === "settings.template.json") {
@@ -89,6 +92,16 @@ for (const provider of Object.keys({ ...previousModels, ...nextModels })) {
 	}
 }
 sync("subagent-config.template.json", join(agentDir, "extensions", "subagent", "config.json"));
+// Realtime voice: on Codex Live, Pi receives only the task delegation model's rewrite of what was
+// said, so Vibes uses a stronger model than GipPity's default (docs/realtime-voice.md). Until this
+// template shipped, everyone had GipPity's default, and /gippity writes it out in full.
+// Codex Conversion's voice settings come first. Here rather than in scripts/vibes, because a hotfix
+// runs the previous night's script, which calls this file but not the copy.
+const copied = migrateVoiceSettings(agentDir);
+if (copied) console.log(`Copied realtime voice settings from pi-codex-conversion.json to ${copied}`);
+sync("pi-gippity-control.template.json", join(agentDir, "pi-gippity-control.json"), ["taskDelegationModel", "taskDelegationReasoning"], "voice", {
+	voice: { taskDelegationModel: "openai-codex/gpt-6-luna", taskDelegationReasoning: "low" },
+});
 
 // Match pi-web-access's config lookup without shadowing an existing legacy config (and its providers).
 function webSearchConfigPath() {

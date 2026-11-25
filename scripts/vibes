@@ -90,6 +90,21 @@ update_brew() {
 	brew update && brew upgrade --formula && brew install --formula --quiet bat git-delta glow
 }
 
+# Use Homebrew for new Mac installations; keep existing curl installs and forks intact.
+# The CLI's noninteractive startup installs its own agent skill in ~/.agents/skills.
+# Terminal integration belongs to upstream (Rex, cmux, Ghostty, and others), not Vibes.
+update_terminal_browser() {
+	[ "$(uname -s)" = Darwin ] || return 0
+	if ! command -v brew >/dev/null; then
+		command -v terminal-browser >/dev/null || { echo "terminal-browser needs Homebrew; /onboard sets it up"; return 1; }
+	elif brew list --cask terminal-browser >/dev/null 2>&1; then
+		brew upgrade --cask terminal-browser || return $?
+	elif ! command -v terminal-browser >/dev/null; then
+		brew install --cask terminal-browser || return $?
+	fi
+	terminal-browser --version
+}
+
 update_nvm() {
 	[ -d "$NVM_DIR/.git" ] || { echo "nvm isn't installed in $NVM_DIR; /onboard sets it up"; return 1; }
 	git -C "$NVM_DIR" fetch --quiet --tags origin || return 1
@@ -374,6 +389,7 @@ cmd_hotfix_check() {
 	previous=$(mktemp -d)
 	cp "$VIBES/settings.template.json" "$VIBES/subagent-config.template.json" "$VIBES/web-search.template.json" "$previous/" 2>/dev/null
 	[ ! -f "$VIBES/models.template.json" ] || cp "$VIBES/models.template.json" "$previous/"
+	[ ! -f "$VIBES/pi-gippity-control.template.json" ] || cp "$VIBES/pi-gippity-control.template.json" "$previous/"
 	step packages update_vibes_packages
 	step rolling-packages refresh_rolling_packages
 	step claude-code ensure_claude_code
@@ -895,6 +911,7 @@ cmd_update() {
 		previous=$(mktemp -d)
 		cp "$VIBES/settings.template.json" "$VIBES/subagent-config.template.json" "$VIBES/web-search.template.json" "$previous/" 2>/dev/null
 		[ ! -f "$VIBES/models.template.json" ] || cp "$VIBES/models.template.json" "$previous/"
+		[ ! -f "$VIBES/pi-gippity-control.template.json" ] || cp "$VIBES/pi-gippity-control.template.json" "$previous/"
 		# Hotfixes tag main, so updating to main now includes every hotfix tagged before it.
 		hotfix=$(latest_hotfix 2>/dev/null)
 		step packages update_vibes_packages
@@ -915,6 +932,7 @@ cmd_update() {
 	step surf update_surf
 	step settings sync_settings "$previous"
 	rm -rf "$previous"
+	step terminal-browser update_terminal_browser
 	! pi_1_migration_needed || step mcp-before capture_pi_1_baseline
 	step pi install_pinned_pi
 	step models update_models

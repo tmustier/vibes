@@ -84,6 +84,7 @@ save_templates() {
   previous="$(mktemp -d)"
   cp "$repo/settings.template.json" "$repo/subagent-config.template.json" "$repo/web-search.template.json" "$previous/"
   [ ! -f "$repo/models.template.json" ] || cp "$repo/models.template.json" "$previous/"
+  [ ! -f "$repo/pi-gippity-control.template.json" ] || cp "$repo/pi-gippity-control.template.json" "$previous/"
 }
 packages() {
   (cd "$repo" && npm ci --omit=dev --ignore-scripts && npm install --no-save --omit=dev codex-computer-use-mcp@latest @tmustier/pi-session-hud@latest)
@@ -111,6 +112,7 @@ run_step surf node "$repo/scripts/surf-runtime.mjs" update
 run_step settings node "$repo/scripts/sync-settings.mjs" "$previous" "$repo" "$AGENT_DIR"
 run_step pi install_pi
 run_step models refresh_models
+run_step terminal-browser update_terminal_browser
 run_step startup "$repo/scripts/vibes" check
 run_step checkout-clean check_clean
 printf '=== update succeeded: %s ===\n' "$(git -C "$repo" rev-parse --short HEAD)"
