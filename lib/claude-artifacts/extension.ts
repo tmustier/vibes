@@ -4,7 +4,7 @@ import { execFile, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { accessSync, constants } from "node:fs";
 import { mkdir, readFile, realpath, stat, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { delimiter, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -152,7 +152,50 @@ type ArtifactResult = {
 	file_list?: { files: FileHash[] };
 	file_read?: FileHash;
 	files_read?: { files: FileRead[] };
+	updated?: boolean;
+	capabilities?: Record<string, unknown>;
+	stored?: { capabilities?: Record<string, unknown> };
 };
+// What Pi reads from the Claude desktop app's own files, which say where installed artifact apps
+// live and which Claude account it is signed in to.
+type DesktopApp = { version?: string; accountUuid?: string; apps: { artifactUuid: string; bundle: string }[] };
+// The first Claude for Mac and Windows release with "Install as app", from Anthropic's install guide.
+const INSTALL_MIN_VERSION = "6.28899.0";
+
+const readJson = (file: string) => readFile(file, "utf8").then(JSON.parse, () => undefined);
+
+/** Whether a Claude desktop app version predates "Install as app". */
+export function cannotInstallApps(version: string): boolean {
+	const have = version.split(".").map(Number);
+	const need = INSTALL_MIN_VERSION.split(".").map(Number);
+	for (let at = 0; at < need.length; at++) if ((have[at] ?? 0) !== need[at]) return (have[at] ?? 0) < need[at];
+	return false;
+}
+
+/** The Claude desktop app's version, sign-in and installed artifact apps, or nothing when it is not installed. */
+export async function readDesktopApp(dir: string, bundles = ["/Applications/Claude.app", join(homedir(), "Applications", "Claude.app")]): Promise<DesktopApp | undefined> {
+	const config = await readJson(join(dir, "config.json"));
+	if (!config) return undefined;
+	const installed = await readJson(join(dir, "artifact-apps-installed.json"));
+	let version: string | undefined;
+	for (const bundle of bundles) {
+		const plist = await readFile(join(bundle, "Contents", "Info.plist"), "utf8").catch(() => "");
+		version = plist.match(/<key>CFBundleShortVersionString<\/key>\s*<string>([^<]+)<\/string>/)?.[1];
+		if (version) break;
+	}
+	return { version, accountUuid: config.lastKnownAccountUuid, apps: installed?.apps ?? [] };
+}
+
+/** What the model tells a user whose Claude desktop app is too old to install artifacts as apps. */
+const updateFirst = (version: string) =>
+	`The Claude desktop app on this computer is version ${version}, which is too old to install artifacts as apps (it needs ${INSTALL_MIN_VERSION} or later), so Install as app will not appear. Tell the user to update it first: in the Claude desktop app, open the Claude menu and choose Check for Updates (or Restart to Update), then install it from the artifact's title menu.`;
+
+/** The Claude account Claude Code publishes as. */
+export async function readClaudeCodeAccount(env: NodeJS.ProcessEnv): Promise<{ accountUuid?: string; email?: string } | undefined> {
+	const file = env.CLAUDE_CONFIG_DIR ? join(env.CLAUDE_CONFIG_DIR, ".claude.json") : join(homedir(), ".claude.json");
+	const account = (await readJson(file))?.oauthAccount;
+	return account && { accountUuid: account.accountUuid, email: account.emailAddress };
+}
 
 const resultText = (content: McpContent[]) => content.map((block) => (block.type === "text" ? block.text : "")).join("\n");
 
@@ -165,6 +208,9 @@ export default function claudeArtifacts(
 		idleMs = IDLE_MS,
 		cacheDir = join(getAgentDir(), "cache", "claude-artifacts"),
 		openUrl = (url: string) => run("open", [url]),
+		desktopApp = () => readDesktopApp(join(homedir(), "Library", "Application Support", "Claude")),
+		claudeCodeAccount = () => readClaudeCodeAccount(env),
+		appsDir = join(homedir(), "Applications", "Claude Apps"),
 	} = {},
 ) {
 	// On by default: without Claude Code, add nothing.
@@ -243,6 +289,8 @@ export default function claudeArtifacts(
 	// Claude Code forgets each call; keep the conversation's published files and seen versions.
 	const publishedFiles = new Map<string, string>();
 	const seenVersions = new Map<string, string>();
+	// Artifacts this conversation published with the `desktop` capability, which install as apps.
+	const desktopArtifacts = new Set<string>();
 	const seenFiles = new Map<string, Map<string, string>>();
 	// A large handed-over page, until every line of its saved file has been read.
 	const unreadSaved = new Map<string, { id: string; version: string; unread: Set<number> }>();
@@ -262,8 +310,10 @@ export default function claudeArtifacts(
 		seenFiles.clear();
 		unreadSaved.clear();
 		refusedPages.clear();
+		desktopArtifacts.clear();
 	});
-	function record(action: unknown, inputUrl: unknown, text: string) {
+	/** Records what a result shows the conversation has seen, and returns a successful publish's result. */
+	function record(action: unknown, inputUrl: unknown, text: string): ArtifactResult | undefined {
 		let result: ArtifactResult | undefined;
 		try {
 			result = JSON.parse(text);
@@ -272,9 +322,12 @@ export default function claudeArtifacts(
 			if (!result?.artifact_id || !result.version) return;
 			seenVersions.set(result.artifact_id, result.version);
 			refusedPages.delete(result.artifact_id);
+			const capabilities = result.stored?.capabilities ?? result.capabilities;
+			if (capabilities?.desktop) desktopArtifacts.add(result.artifact_id);
+			else if (capabilities) desktopArtifacts.delete(result.artifact_id);
 			if (result.path && result.url) publishedFiles.set(result.path, result.url);
 			for (const row of result.files_written ?? []) sawFile(result.artifact_id, row);
-			return;
+			return result;
 		}
 		// "[Artifact {uuid} (version {version}) — owned by you, ..." heads a page read.
 		for (const [, id, version] of text.matchAll(/\[Artifact ([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}) \(version ([^)\s]+)\)/g)) {
@@ -354,9 +407,18 @@ export default function claudeArtifacts(
 			const text = JSON.stringify({ deleted: true, url: removed.url, artifact_id: removed.id, note: "Deleted after the user confirmed in Pi. The link no longer works." });
 			return { content: [{ type: "text", text }], isError: false };
 		}
-		if (event.toolName === ARTIFACT_TOOL && !event.isError) record(event.input.action ?? "publish", event.input.url, resultText(event.content));
 		const unseen = unseenLive.get(event.toolCallId);
 		unseenLive.delete(event.toolCallId);
+		if (event.toolName === ARTIFACT_TOOL && !event.isError) {
+			const published = record(event.input.action ?? "publish", event.input.url, resultText(event.content));
+			// Only the Claude desktop app installs an artifact as an app, so a new one points the model at `open`.
+			const desktop = published?.artifact_id && published.updated === false && desktopArtifacts.has(published.artifact_id) ? await desktopApp() : undefined;
+			if (desktop) {
+				const old = desktop.version && cannotInstallApps(desktop.version) ? ` ${updateFirst(desktop.version)}` : "";
+				const note = `This artifact declares \`desktop\`, so it can be installed as an app from the Claude desktop app. To let the user install it now, call Artifact with action \`open\` and its url: Pi opens it in the Claude desktop app.${old}`;
+				return { content: [...event.content, { type: "text", text: note }] };
+			}
+		}
 		// Claude Code reads the live version into a refusal and counts it as viewed (its "autoread").
 		// Over MCP it cannot record that, and sometimes asks for a read instead, so Pi does both.
 		if (unseen && event.isError) {
@@ -405,9 +467,31 @@ export default function claudeArtifacts(
 		}
 		// Over MCP, Claude Code reports `opened` without opening a browser, so Pi opens the link.
 		if (event.toolName !== ARTIFACT_TOOL || event.input.action !== "open" || event.isError) return;
-		const note = !ctx.hasUI
-			? "This Pi session has no screen to open it on. Give the user the link."
-			: await openUrl(String(event.input.url)).then(() => "Pi opened it in the user's browser.", (error: Error) => `Pi could not open it (${error.message}). Give the user the link.`);
+		if (!ctx.hasUI) return { content: [...event.content, { type: "text", text: "This Pi session has no screen to open it on. Give the user the link." }] };
+		const url = String(event.input.url);
+		const failed = (error: Error) => `Pi could not open it (${error.message}). Give the user the link.`;
+		const inBrowser = (why = "") => openUrl(url).then(() => `${why}Pi opened it in the user's browser.`, failed);
+		const id = artifactId(url);
+		const desktop = await desktopApp();
+		const app = desktop?.apps.find((row) => row.artifactUuid === id);
+		let note: string;
+		if (!id || !desktop || !(app || desktopArtifacts.has(id))) note = await inBrowser();
+		else {
+			const account = await claudeCodeAccount();
+			if (desktop.accountUuid && account?.accountUuid && desktop.accountUuid !== account.accountUuid) {
+				note = await inBrowser(`The Claude desktop app is signed in to a different Claude account from the one that published this artifact${account.email ? ` (${account.email})` : ""}, so it cannot open it there or install it. To install it as an app, the user signs the Claude desktop app in to that account and asks again. `);
+			} else if (app) {
+				note = await openUrl(join(appsDir, app.bundle)).then(() => `It is installed as the app "${app.bundle.replace(/\.app$/, "")}"; Pi opened that app.`, failed);
+			} else {
+				const next = desktop.version && cannotInstallApps(desktop.version)
+					? updateFirst(desktop.version)
+					: "To install it, the user clicks the artifact's name at the top, chooses Install as app, then Install; the app then asks for each permission it uses on first use. If Install as app is missing, Claude for Mac needs updating (Claude menu, Check for Updates) or the organization has turned app installs off.";
+				note = await openUrl(`claude://claude.ai/code/artifact/${id}`).then(
+					() => `Pi opened it in the Claude desktop app. ${next}`,
+					failed,
+				);
+			}
+		}
 		return { content: [...event.content, { type: "text", text: note }] };
 	});
 }

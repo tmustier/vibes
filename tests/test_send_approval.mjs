@@ -1,4 +1,4 @@
-// Every native or legacy adapter MCP email send asks individually; headless calls are denied.
+// Every native or legacy adapter Superhuman or Front email send asks individually; headless calls are denied.
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -43,6 +43,14 @@ assert.equal(session.asked.length, 6);
 assert.equal(await session.native("mcp__superhuman-mail__create_or_update_draft"), undefined);
 assert.equal(await session.adapter("create_or_update_draft"), "not claimed");
 assert.equal((await start(false).native("mcp__superhuman-mail__send_draft")).block, true);
+const front = start(true, ["Send", "Don't send", "Send"]);
+assert.equal(await front.native("mcp__front__send_message", { draftId: "msg_1" }), undefined);
+assert.match(front.asked[0], /Send this email now\? \(front send_message\)[\s\S]*draftId: msg_1/);
+assert.equal((await front.native("mcp__front__send_message", { draftId: "msg_1" })).block, true);
+assert.equal(await front.native("mcp__front__create_draft"), undefined);
+assert.equal(await front.adapter("send_message"), "allow_once");
+assert.equal(front.asked.length, 3, "Front drafts need no approval; every Front send does");
+assert.equal((await start(false).native("mcp__front__send_message", { draftId: "msg_1" })).block, true);
 assert.equal(await start(false).adapter("send_draft"), "deny");
 rmSync(process.env.PI_CODING_AGENT_DIR, { recursive: true });
 console.log("ok");

@@ -4,7 +4,7 @@ import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import claudeArtifacts from "../lib/claude-artifacts/extension.ts";
+import claudeArtifacts, { cannotInstallApps, readClaudeCodeAccount, readDesktopApp } from "../lib/claude-artifacts/extension.ts";
 
 const TOOL = "mcp__claude_artifacts__Artifact";
 const uuid = "9c520471-a3d4-4fee-be90-98ccd65e8d63";
@@ -53,7 +53,7 @@ function load(options = {}) {
 		getActiveTools: () => active,
 		setActiveTools: (names) => { active = names; },
 	};
-	claudeArtifacts(pi, { cacheDir, idleMs: 300, ...options, env: { PATH: claudeBin, ...options.env } });
+	claudeArtifacts(pi, { cacheDir, idleMs: 300, desktopApp: async () => undefined, ...options, env: { PATH: claudeBin, ...options.env } });
 	return { handlers, tools, active: () => active };
 }
 
@@ -207,6 +207,65 @@ assert.equal(shown.content[0].text, '{"opened":true}');
 await toolResult(nativeOpen, ctx(false));
 assert.deepEqual(opened, [url], "a session without a screen opens nothing");
 assert.equal(await toolResult({ ...nativeOpen, isError: true }, ctx()), undefined, "a failed open is left alone");
+
+// Only the Claude desktop app installs an artifact as an app, so Pi opens a `desktop` artifact there.
+const desktopLinks = [];
+let desktop = { accountUuid: "acct-1", apps: [] };
+const account = { accountUuid: "acct-1", email: "me@example.com" };
+const apps = load({ env: {}, desktopApp: async () => desktop, claudeCodeAccount: async () => account, appsDir: "/Apps", openUrl: async (link) => { desktopLinks.push(link); } }).handlers;
+const appResult = (input, result, id) => apps.get("tool_result")({ toolName: TOOL, toolCallId: id, input, isError: false, content: [{ type: "text", text: JSON.stringify(result) }] }, ctx());
+const appUrl = "https://claude.ai/artifact/Bfh39g1eyLAmApX2YwY47B";
+const appId = "566252d5-d48b-4db6-ba77-0538c16e75aa";
+const desktopPublish = { url: appUrl, path: "/work/app.html", artifact_id: appId, version: "1", updated: false, capabilities: { desktop: {} }, stored: { capabilities: { desktop: {} } } };
+const openApp = (id) => appResult({ action: "open", url: appUrl }, { opened: true }, id);
+assert.equal((await openApp("a0")).content[1].text, "Pi opened it in the user's browser.", "an artifact not known to be a desktop app opens in the browser");
+assert.deepEqual(desktopLinks, [appUrl]);
+const firstPublish = await appResult({ file_path: "app.html", capabilities: { desktop: {} } }, desktopPublish, "a1");
+assert.match(firstPublish.content[1].text, /call Artifact with action `open`/, "a new desktop artifact points the model at open");
+assert.equal(await appResult({ file_path: "app.html" }, { ...desktopPublish, version: "2", updated: true, capabilities: undefined }, "a2"), undefined, "an update adds no note");
+assert.match((await openApp("a3")).content[1].text, /Claude desktop app[\s\S]*Install as app/, "an update that keeps the stored declaration stays a desktop app");
+assert.equal(desktopLinks.at(-1), `claude://claude.ai/code/artifact/${appId}`);
+desktop = { accountUuid: "acct-2", apps: [] };
+const otherAccount = (await openApp("a4")).content[1].text;
+assert.match(otherAccount, /different Claude account[\s\S]*me@example\.com[\s\S]*browser/, "a desktop app signed in elsewhere cannot open it, so Pi says so and uses the browser");
+assert.equal(desktopLinks.at(-1), appUrl);
+desktop = { accountUuid: "acct-1", apps: [{ artifactUuid: appId, bundle: "Six Tonight.app" }] };
+assert.match((await openApp("a5")).content[1].text, /installed as the app "Six Tonight"/);
+assert.equal(desktopLinks.at(-1), "/Apps/Six Tonight.app", "an installed app opens itself");
+desktop = { accountUuid: "acct-1", apps: [] };
+await appResult({ url: appUrl, file_path: "app.html", capabilities: {} }, { ...desktopPublish, updated: true, capabilities: {}, stored: { capabilities: {} } }, "a6");
+await openApp("a7");
+assert.equal(desktopLinks.at(-1), appUrl, "clearing the declaration makes it an ordinary artifact again");
+// A Claude desktop app too old to install apps still opens the artifact, and the model says to update it first.
+desktop = { version: "6.6395.1", accountUuid: "acct-1", apps: [] };
+await appResult({ url: appUrl, file_path: "app.html", capabilities: { desktop: {} } }, { ...desktopPublish, updated: true }, "old1");
+const oldOpen = (await openApp("old2")).content[1].text;
+assert.match(oldOpen, /^Pi opened it in the Claude desktop app\. [\s\S]*version 6\.6395\.1[\s\S]*too old[\s\S]*Check for Updates/);
+assert.doesNotMatch(oldOpen, /chooses Install as app, then Install/, "no install steps the old app cannot follow");
+assert.equal(desktopLinks.at(-1), `claude://claude.ai/code/artifact/${appId}`);
+const oldApps = load({ env: {}, desktopApp: async () => ({ version: "6.6395.1", apps: [] }), claudeCodeAccount: async () => account, openUrl: async () => {} }).handlers;
+const oldPublish = await oldApps.get("tool_result")({ toolName: TOOL, toolCallId: "old3", input: { file_path: "app.html" }, isError: false, content: [{ type: "text", text: JSON.stringify(desktopPublish) }] }, ctx());
+assert.match(oldPublish.content[1].text, /call Artifact with action `open`[\s\S]*too old/, "a new desktop artifact on an old app says to update");
+desktop = { version: "7.37095.0", accountUuid: "acct-1", apps: [] };
+assert.match((await openApp("old4")).content[1].text, /chooses Install as app, then Install/, "a current app gets the install steps");
+for (const [version, old] of [["6.6395.1", true], ["6.28898.9", true], ["6.28899.0", false], ["6.28899.6", false], ["7.37095.0", false], ["5.99999.0", true]]) assert.equal(cannotInstallApps(version), old, version);
+const noDesktop = load({ env: {}, claudeCodeAccount: async () => account, openUrl: async () => {} }).handlers;
+assert.equal(await noDesktop.get("tool_result")({ toolName: TOOL, toolCallId: "a8", input: { file_path: "app.html" }, isError: false, content: [{ type: "text", text: JSON.stringify(desktopPublish) }] }, ctx()), undefined, "without the Claude desktop app there is nothing to point at");
+
+// Pi reads the desktop app's sign-in and installed apps, and Claude Code's account, from their own files.
+const desktopDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-artifacts-desktop-"));
+const bundle = path.join(desktopDir, "Claude.app");
+assert.equal(await readDesktopApp(desktopDir, [bundle]), undefined, "no desktop app without its config");
+fs.writeFileSync(path.join(desktopDir, "config.json"), JSON.stringify({ lastKnownAccountUuid: "acct-1" }));
+assert.deepEqual(await readDesktopApp(desktopDir, [bundle]), { version: undefined, accountUuid: "acct-1", apps: [] }, "no app installed yet, and no version without the app");
+fs.mkdirSync(path.join(bundle, "Contents"), { recursive: true });
+fs.writeFileSync(path.join(bundle, "Contents", "Info.plist"), '<?xml version="1.0"?>\n<plist><dict>\n\t<key>CFBundleName</key>\n\t<string>Claude</string>\n\t<key>CFBundleShortVersionString</key>\n\t<string>6.6395.1</string>\n</dict></plist>');
+assert.equal((await readDesktopApp(desktopDir, [path.join(desktopDir, "missing.app"), bundle])).version, "6.6395.1", "the version comes from the first installed app bundle");
+fs.writeFileSync(path.join(desktopDir, "artifact-apps-installed.json"), JSON.stringify({ apps: [{ installId: "x", artifactUuid: appId, bundle: "Six Tonight.app" }] }));
+assert.deepEqual((await readDesktopApp(desktopDir, [bundle])).apps.map((row) => row.bundle), ["Six Tonight.app"]);
+fs.writeFileSync(path.join(desktopDir, ".claude.json"), JSON.stringify({ oauthAccount: { accountUuid: "acct-1", emailAddress: "me@example.com" } }));
+assert.deepEqual(await readClaudeCodeAccount({ CLAUDE_CONFIG_DIR: desktopDir }), account);
+fs.rmSync(desktopDir, { recursive: true });
 
 // The live check reads claude.ai's metadata, where a single-page artifact's index.html has no hash.
 const liveCheck = spawnSync("python3", ["-c", `
@@ -367,4 +426,4 @@ const failed = await failing.handlers.get("tool_call")(call({ action: "delete", 
 assert.equal(failed.block, true);
 assert.match(failed.reason, /HTTP 500/, "the model is told why the delete failed");
 
-console.log("ok: claude-artifacts registration, link parsing, delete confirmation, open, live check, session Claude Code and conversation state");
+console.log("ok: claude-artifacts registration, link parsing, delete confirmation, open, desktop apps, live check, session Claude Code and conversation state");
