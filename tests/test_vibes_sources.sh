@@ -11,10 +11,11 @@ cat >"$PI_CODING_AGENT_DIR/settings.json" <<'JSON'
 {"packages": [
 	{"source": "git:github.com/tmustier/vibes@release/test", "extensions": ["!extensions/surf.ts"]},
 	"ssh://git@github.com/anthropics/skills",
+	{"source": "git:github.com/typesafe-ai/skills", "skills": ["skills/typesafe-ai/SKILL.md"]},
 	"git:github.com/tmustier/pi-extensions"
 ]}
 JSON
-expected=$'git:github.com/tmustier/vibes@release/test\nssh://git@github.com/anthropics/skills'
+expected=$'git:github.com/tmustier/vibes@release/test\nssh://git@github.com/anthropics/skills\ngit:github.com/typesafe-ai/skills'
 source scripts/vibes
 actual=$(node lib/vibes-sources.mjs "$(pi_bin)" settings.template.json)
 [ "$actual" = "$expected" ] || { echo "FAIL: got"; echo "$actual"; exit 1; }
