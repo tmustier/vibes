@@ -111,6 +111,7 @@ run_step surf node "$repo/scripts/surf-runtime.mjs" update
 run_step settings node "$repo/scripts/sync-settings.mjs" "$previous" "$repo" "$AGENT_DIR"
 run_step pi install_pi
 run_step models refresh_models
+run_step terminal-browser update_terminal_browser
 run_step startup "$repo/scripts/vibes" check
 run_step checkout-clean check_clean
 printf '=== update succeeded: %s ===\n' "$(git -C "$repo" rev-parse --short HEAD)"

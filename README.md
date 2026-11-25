@@ -46,6 +46,10 @@ Vibes bundles [pi-claude-code](https://github.com/earendil-works/pi-claude-code)
 
 Set `"claude-code": false` in your feature choices to disable the provider and skip the CLI installation.
 
+## Terminal browser
+
+[terminal-browser](https://terminal-browser.com/) shows a live website beside your conversation in cmux, Ghostty, Rex and other supported terminals. Ask Pi to open a page beside you, or run `terminal-browser open https://example.com --split right`. Pi reads and drives the page with the `terminal-browser` skill the CLI installs in `~/.agents/skills`. `vibes update` installs it with Homebrew when it is missing and upgrades Homebrew copies; an installation from elsewhere stays as it is (`terminal-browser upgrade` updates it).
+
 ## Idle parking
 
 Parking is optional and needs the launcher as well as the extension. To enable it, add this alias to `~/.zshrc`, adjusting the path if your clone lives elsewhere:

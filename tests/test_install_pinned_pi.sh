@@ -47,7 +47,7 @@ cp "$VIBES/scripts/inventory" "$VIBES/scripts/usage-telemetry"
 cp scripts/refresh "$VIBES/scripts/refresh"
 STATUS_FILE=$scratch/status NOTES_FILE=$scratch/notes LOG_FILE=$scratch/log
 VIBES_UPDATE_LOCKED=1 VIBES_UPDATE_CONTINUED=1 VIBES_UPDATE_PREVIOUS=$scratch/previous VIBES_UPDATE_RESULTS=$'packages\tok\t'
-for f in load_nvm ensure_claude_code refresh_rolling_packages update_surf sync_settings install_update_job install_hotfix_job install_refresh_job install_chatgpt_job update_repo cmd_check osascript; do eval "$f() { :; }"; done
+for f in load_nvm ensure_claude_code refresh_rolling_packages update_surf sync_settings update_terminal_browser install_update_job install_hotfix_job install_refresh_job install_chatgpt_job update_repo cmd_check osascript; do eval "$f() { :; }"; done
 # HOME is scratch here, so a job loaded into the real launchd session would point at a deleted folder.
 launchctl() { echo "$*" >>"$scratch/launchctl"; }
 cmd_update >/dev/null

@@ -93,13 +93,13 @@ previous=$(mktemp -d)
 (
 	source scripts/vibes
 	VIBES=$scratch/handover LOG_FILE=$scratch/handover-log STATUS_FILE=$scratch/status.json NOTES_FILE=$scratch/notes VIBES_UPDATE_LOCKED=1
-	for f in load_nvm ensure_claude_code refresh_rolling_packages update_surf sync_settings install_pinned_pi update_models update_chatgpt install_update_job install_hotfix_job install_refresh_job install_chatgpt_job update_repo cmd_check osascript; do eval "$f() { :; }"; done
+	for f in load_nvm ensure_claude_code refresh_rolling_packages update_surf sync_settings update_terminal_browser install_pinned_pi update_models update_chatgpt install_update_job install_hotfix_job install_refresh_job install_chatgpt_job update_repo cmd_check osascript; do eval "$f() { :; }"; done
 	mkdir -p "$VIBES/scripts" && printf '#!/bin/bash\n' >"$VIBES/scripts/inventory" && chmod +x "$VIBES/scripts/inventory"
 	cp "$VIBES/scripts/inventory" "$VIBES/scripts/usage-telemetry"
 	export VIBES_UPDATE_CONTINUED=1 VIBES_UPDATE_PREVIOUS=$previous VIBES_UPDATE_RESULTS=$'homebrew\tok\t\nnpm\tfail\texit 1\n'
 	cmd_update
 ) >/dev/null 2>&1
-check "continued: records the handed-over and new steps" '[ "$(node -e "const s=require(process.argv[1]);console.log(s.steps.map(x=>x.name+(x.ok?\"\":\"!\")).join(\" \"))" "$scratch/status.json")" = "homebrew npm! claude-code rolling-packages surf settings pi models update-job hotfix-job refresh-job chatgpt-job startup telemetry usage-telemetry" ]'
+check "continued: records the handed-over and new steps" '[ "$(node -e "const s=require(process.argv[1]);console.log(s.steps.map(x=>x.name+(x.ok?\"\":\"!\")).join(\" \"))" "$scratch/status.json")" = "homebrew npm! claude-code rolling-packages surf settings terminal-browser pi models update-job hotfix-job refresh-job chatgpt-job startup telemetry usage-telemetry" ]'
 rm -rf "$previous"
 
 # The first update to the Pi 1.0 pin captures the MCP baseline before Pi moves and runs the migration
@@ -115,15 +115,15 @@ migration_update() {
 	(
 		source scripts/vibes
 		VIBES=$scratch/migration LOG_FILE=$scratch/migration-log STATUS_FILE=$scratch/migration-status.json NOTES_FILE=$scratch/migration-notes VIBES_UPDATE_LOCKED=1 PI_1_MARKER=$scratch/migration-marker
-		for f in load_nvm ensure_claude_code refresh_rolling_packages update_surf sync_settings install_pinned_pi update_models update_chatgpt install_update_job install_hotfix_job install_refresh_job install_chatgpt_job update_repo cmd_check osascript capture_pi_1_baseline; do eval "$f() { :; }"; done
+		for f in load_nvm ensure_claude_code refresh_rolling_packages update_surf sync_settings update_terminal_browser install_pinned_pi update_models update_chatgpt install_update_job install_hotfix_job install_refresh_job install_chatgpt_job update_repo cmd_check osascript capture_pi_1_baseline; do eval "$f() { :; }"; done
 		run_pi_1_migration() { touch "$PI_1_MARKER"; }
 		export VIBES_UPDATE_CONTINUED=1 VIBES_UPDATE_PREVIOUS=$(mktemp -d) VIBES_UPDATE_RESULTS=$'packages\tok\t\n'
 		cmd_update
 	) >/dev/null 2>&1
 	node -e "const s=require(process.argv[1]); console.log(s.steps.map(x=>x.name).join(' '))" "$scratch/migration-status.json"
 }
-check "first 1.0 update: baseline before Pi moves, migration after the startup check" '[ "$(migration_update)" = "packages claude-code rolling-packages surf settings mcp-before pi models update-job hotfix-job refresh-job chatgpt-job startup pi-1-migration telemetry usage-telemetry" ]'
-check "verified laptop: no migration steps" '[ "$(migration_update)" = "packages claude-code rolling-packages surf settings pi models update-job hotfix-job refresh-job chatgpt-job startup telemetry usage-telemetry" ]'
+check "first 1.0 update: baseline before Pi moves, migration after the startup check" '[ "$(migration_update)" = "packages claude-code rolling-packages surf settings terminal-browser mcp-before pi models update-job hotfix-job refresh-job chatgpt-job startup pi-1-migration telemetry usage-telemetry" ]'
+check "verified laptop: no migration steps" '[ "$(migration_update)" = "packages claude-code rolling-packages surf settings terminal-browser pi models update-job hotfix-job refresh-job chatgpt-job startup telemetry usage-telemetry" ]'
 
 # Upload-only failures keep the installation successful, but retain a nonzero command exit.
 printf '#!/bin/bash\nexit 1\n' >"$scratch/migration/scripts/usage-telemetry"
@@ -131,7 +131,7 @@ pending_update() {
 	(
 		source scripts/vibes
 		VIBES=$scratch/migration LOG_FILE=$scratch/pending-log STATUS_FILE=$PI_CODING_AGENT_DIR/vibes-update.json NOTES_FILE=$scratch/pending-notes VIBES_UPDATE_LOCKED=1
-		for f in load_nvm ensure_claude_code refresh_rolling_packages sync_settings install_pinned_pi update_models update_chatgpt install_update_job install_hotfix_job install_refresh_job install_chatgpt_job update_repo; do eval "$f() { :; }"; done
+		for f in load_nvm ensure_claude_code refresh_rolling_packages sync_settings update_terminal_browser install_pinned_pi update_models update_chatgpt install_update_job install_hotfix_job install_refresh_job install_chatgpt_job update_repo; do eval "$f() { :; }"; done
 		update_surf() { return "$surf_code"; }
 		update_models() { return "$models_code"; }
 		pi_1_migration_needed() { return 1; }
@@ -201,4 +201,65 @@ check "by hand: printed and logged" '[ "$out" = by-hand ] && grep -qx by-hand "$
 sleep 0.5
 check "launchd: logged once" '[ "$(grep -cx launchd "$LOG_FILE")" = 1 ]'
 
+# Terminal browser: install/update the Homebrew cask without taking over an existing installation.
+tb=$scratch/terminal-browser
+mkdir -p "$tb/bin"
+tb_update() {
+	(
+		uname() { echo "${TB_OS:-Darwin}"; }
+		brew() {
+			echo "$*" >>"$tb/brew-calls"
+			case "$1" in
+			list) [ -n "${TB_MANAGED:-}" ] ;;
+			install|upgrade)
+				[ -z "${TB_BREW_FAIL:-}" ] || return 7
+				printf '#!/bin/bash\necho "$*" >>"%s/cli-calls"\nexit "${TB_CLI_FAIL:-0}"\n' "$tb" >"$tb/bin/terminal-browser"
+				chmod +x "$tb/bin/terminal-browser"
+				;;
+			esac
+		}
+		export PATH="$tb/bin:/usr/bin:/bin"
+		update_terminal_browser
+	) >"$tb/output" 2>&1
+}
+tb_update
+check "terminal-browser missing: installs cask and initialises upstream skill via CLI startup" '[ $? -eq 0 ] && grep -qx "install --cask terminal-browser" "$tb/brew-calls" && grep -qx -- --version "$tb/cli-calls"'
+: >"$tb/brew-calls"
+TB_MANAGED=1 tb_update
+check "terminal-browser managed: upgrades only that cask" '[ $? -eq 0 ] && grep -qx "upgrade --cask terminal-browser" "$tb/brew-calls"'
+: >"$tb/brew-calls"
+tb_update
+check "terminal-browser existing curl install or fork: no install or upgrade" '[ $? -eq 0 ] && [ "$(cat "$tb/brew-calls")" = "list --cask terminal-browser" ]'
+TB_MANAGED=1 TB_BREW_FAIL=1 tb_update
+check "terminal-browser Homebrew failure: step fails" '[ $? -eq 7 ]'
+export TB_CLI_FAIL=9
+tb_update
+check "terminal-browser broken CLI: step fails" '[ $? -eq 9 ]'
+unset TB_CLI_FAIL
+(
+	unset -f brew
+	uname() { echo Darwin; }
+	PATH="$tb/bin:/usr/bin:/bin" update_terminal_browser
+) >"$tb/output" 2>&1
+check "terminal-browser without Homebrew: existing CLI works" '[ $? -eq 0 ]'
+rm "$tb/bin/terminal-browser"
+(
+	unset -f brew
+	uname() { echo Darwin; }
+	PATH="$tb/bin:/usr/bin:/bin" update_terminal_browser
+) >"$tb/output" 2>&1
+check "terminal-browser without Homebrew or CLI: reports missing installer" '[ $? -eq 1 ] && grep -q "needs Homebrew" "$tb/output"'
+tb_update
+: >"$tb/brew-calls"
+TB_OS=Linux tb_update
+check "terminal-browser non-Mac: no cask calls" '[ $? -eq 0 ] && [ ! -s "$tb/brew-calls" ]'
+# No terminal is required for the update. The CLI chooses its terminal when a page is opened.
+for terminal in rex cmux ghostty; do
+	case $terminal in
+	rex) REX_BLOCK=test tb_update ;;
+	cmux) CMUX_WORKSPACE_ID=test tb_update ;;
+	ghostty) TERM_PROGRAM=ghostty tb_update ;;
+	esac
+	check "terminal-browser $terminal: same installation path" '[ $? -eq 0 ]'
+done
 [ $failures -eq 0 ] && echo ok || exit 1

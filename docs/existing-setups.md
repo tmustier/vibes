@@ -80,6 +80,12 @@ Pi still starts, keeps the user's copy and warns on every start. The causes:
 
 The same extension loads twice, but not through a package entry in `settings.json`, so the bundled copy can't tell. For example, a local checkout linked into `~/.pi/agent/extensions/` (`pi-contextimate` → `~/projects/pine-of-glass/...`). If the user has explicitly chosen to maintain that fork, keep it and exclude the Vibes wrapper. Otherwise remove the link (the checkout keeps any edits) so Vibes owns the resource.
 
+## Terminal browser does not recognise the terminal
+
+An older curl installation reported "terminal-browser cannot control this terminal" in Rex, even though the current release supports it. Check `command -v terminal-browser` and `terminal-browser --version`. `vibes update` installs missing copies through Homebrew and upgrades Homebrew copies, but leaves curl installations and forks intact. Upgrade those through their own installer. Very old copies do not implement `upgrade`; rerun the [official installer](https://github.com/zenbu-labs/terminal-browser#installation) instead. No terminal switch is needed: current terminal-browser supports cmux, Ghostty and Rex, among others.
+
+Run `terminal-browser --version` to initialise the upstream skill in `~/.agents/skills/terminal-browser`, then `/reload`. Do not copy a second skill into Pi's skills folder. If the user previously declined upstream skill installation, preserve that choice; `terminal-browser setup` lets them change it. Check `terminal-browser open https://example.com --split right`, `terminal-browser ls` and `terminal-browser action -- snapshot`. Use `ls --all` and `action --browser <key> -- snapshot` when checking a browser in another terminal tab. Quit a disposable test pane with Ctrl+Q; keep the user's other browsers open.
+
 ## Surf commands are unknown or Surf is missing
 
 `Unknown tool: session.ensure`, an unknown `doctor`, or `js "return …"` failing with `Unexpected token 'return'` can mean the shell CLI, Chrome native host and unpacked extension are older than Vibes' Surf skill. Thomas's laptop had a global 2.9.0 runtime while Vibes loaded 2.25.0. Installing Vibes supplies the Pi resources (including upstream's Pi tools), not a global CLI or Chrome registration.

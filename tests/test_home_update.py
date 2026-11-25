@@ -55,6 +55,9 @@ nvm() {
             "npm": '#!/bin/bash\nprintf "npm %s node=%s\\n" "$*" "$TEST_NODE_SELECTED" >>"$TEST_TRACE"\nexit "${TEST_PACKAGES_EXIT:-0}"\n',
             "pi": f'#!/bin/bash\n[ "$1" = --version ] || printf "pi %s cwd=%s\\n" "$*" "$PWD" >>"$TEST_TRACE"\nprintf "{pinned_pi}\\n"\n',
             "launchctl": '#!/bin/bash\nexit 1\n',
+            # Homebrew without the cask, and a terminal-browser installed some other way.
+            "brew": '#!/bin/bash\nprintf "brew %s\\n" "$*" >>"$TEST_TRACE"\n[ "$1" != list ]\n',
+            "terminal-browser": '#!/bin/bash\nprintf "terminal-browser %s\\n" "$*" >>"$TEST_TRACE"\n',
         }.items():
             path = self.bin / name
             path.write_text(content)
@@ -124,6 +127,12 @@ nvm() {
         self.assertLess(names.index("pi"), names.index("models"))
         self.assertLess(names.index("models"), names.index("startup"))
         self.assertIn(f"pi update --models cwd={self.home}", (self.root / "trace").read_text().splitlines())
+        # terminal-browser is checked after Pi's own updates; an installation from elsewhere stays.
+        self.assertLess(names.index("models"), names.index("terminal-browser"))
+        self.assertLess(names.index("terminal-browser"), names.index("startup"))
+        trace = (self.root / "trace").read_text().splitlines()
+        self.assertIn("terminal-browser --version", trace)
+        self.assertEqual([line for line in trace if line.startswith("brew")], ["brew list --cask terminal-browser"])
         self.assertEqual(status["notes"], ["Surf was updated."])
         self.assertFalse((self.agent / "vibes-update-notes").exists())
         self.assertEqual(self.git(self.repo, "status", "--porcelain"), "")
