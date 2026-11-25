@@ -71,6 +71,7 @@ check "TERM to vibes update stops it" '[ $? -eq 143 ] && sleep 0.5 && ! running'
 mkdir -p "$scratch/handover/scripts"
 cp scripts/refresh "$scratch/handover/scripts/refresh"
 printf '{"toolActivation":"eager"}\n' >"$scratch/handover/web-search.template.json"
+printf '{"voice":{"taskDelegationReasoning":"high"}}\n' >"$scratch/handover/pi-gippity-control.template.json"
 (
 	source scripts/vibes
 	VIBES=$scratch/handover LOG_FILE=$scratch/handover-log VIBES_UPDATE_LOCKED=1
@@ -86,6 +87,7 @@ printf '{"toolActivation":"eager"}\n' >"$scratch/handover/web-search.template.js
 check "handover: runs the new script in the same process" '[ "$(sed -n 1p "$scratch/handover/got")" = "$(cat "$scratch/handover/pid")" ] && [ "$(sed -n 2p "$scratch/handover/got")" = 1 ]'
 check "handover: passes the previous templates" '[ -d "$(sed -n 3p "$scratch/handover/got")" ]'
 check "handover: snapshots the web activation template" 'cmp -s "$scratch/handover/web-search.template.json" "$(sed -n 3p "$scratch/handover/got")/web-search.template.json"'
+check "handover: snapshots the voice delegation template" 'cmp -s "$scratch/handover/pi-gippity-control.template.json" "$(sed -n 3p "$scratch/handover/got")/pi-gippity-control.template.json"'
 check "handover: passes the steps so far" '[ "$(sed -n "4,\$p" "$scratch/handover/got" | cut -f1,2 | tr "\t\n" ": ")" = "homebrew:ok nvm:ok node:ok npm:ok packages:ok " ]'
 rm -rf "$(sed -n 3p "$scratch/handover/got")"
 # The new script picks up from there and records every step.

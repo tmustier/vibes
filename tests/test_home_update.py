@@ -76,8 +76,9 @@ nvm() {
         for path in (seed / "scripts").iterdir():
             path.chmod(0o755)
         (seed / "scripts/sync-settings.mjs").write_text(
-            'import { writeFileSync } from "node:fs";\n'
-            'writeFileSync(process.argv[4] + "/sync-proof", "ok");\n')
+            'import { readdirSync, writeFileSync } from "node:fs";\n'
+            'writeFileSync(process.argv[4] + "/sync-proof", "ok");\n'
+            'writeFileSync(process.argv[4] + "/previous-templates", readdirSync(process.argv[2]).sort().join("\\n"));\n')
         # The real script needs Surf installed; this one records that it ran and leaves a note.
         (seed / "scripts/surf-runtime.mjs").write_text(
             'import { appendFileSync } from "node:fs";\n'
@@ -86,7 +87,7 @@ nvm() {
         (seed / "scripts/ensure-claude-code.mjs").write_text(
             'import { writeFileSync } from "node:fs";\n'
             'writeFileSync(process.env.PI_CODING_AGENT_DIR + "/claude-code-proof", "ok");\n')
-        for name in (".node-version", "package.json", "settings.template.json", "subagent-config.template.json", "web-search.template.json"):
+        for name in (".node-version", "package.json", "settings.template.json", "subagent-config.template.json", "web-search.template.json", "pi-gippity-control.template.json"):
             shutil.copy2(ROOT / name, seed / name)
         self.git(seed, "init", "-q", "-b", "main")
         self.git(seed, "config", "user.name", "Vibes test fixture")
@@ -119,6 +120,8 @@ nvm() {
         self.assertNotIn("agentsTemplateHash", status)
         self.assertEqual(self.file.stat().st_mode & 0o777, 0o600)
         self.assertEqual((self.agent / "sync-proof").read_text(), "ok")
+        # The templates from before the update, so a voice delegation model the user chose stays theirs.
+        self.assertIn("pi-gippity-control.template.json", (self.agent / "previous-templates").read_text().splitlines())
         names = [step["name"] for step in status["steps"]]
         self.assertLess(names.index("packages"), names.index("surf"))
         self.assertLess(names.index("packages"), names.index("claude-code"))

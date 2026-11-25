@@ -389,6 +389,7 @@ cmd_hotfix_check() {
 	previous=$(mktemp -d)
 	cp "$VIBES/settings.template.json" "$VIBES/subagent-config.template.json" "$VIBES/web-search.template.json" "$previous/" 2>/dev/null
 	[ ! -f "$VIBES/models.template.json" ] || cp "$VIBES/models.template.json" "$previous/"
+	[ ! -f "$VIBES/pi-gippity-control.template.json" ] || cp "$VIBES/pi-gippity-control.template.json" "$previous/"
 	step packages update_vibes_packages
 	step rolling-packages refresh_rolling_packages
 	step claude-code ensure_claude_code
@@ -910,6 +911,7 @@ cmd_update() {
 		previous=$(mktemp -d)
 		cp "$VIBES/settings.template.json" "$VIBES/subagent-config.template.json" "$VIBES/web-search.template.json" "$previous/" 2>/dev/null
 		[ ! -f "$VIBES/models.template.json" ] || cp "$VIBES/models.template.json" "$previous/"
+		[ ! -f "$VIBES/pi-gippity-control.template.json" ] || cp "$VIBES/pi-gippity-control.template.json" "$previous/"
 		# Hotfixes tag main, so updating to main now includes every hotfix tagged before it.
 		hotfix=$(latest_hotfix 2>/dev/null)
 		step packages update_vibes_packages

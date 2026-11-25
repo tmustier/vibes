@@ -7,6 +7,7 @@ import { join } from "node:path";
 import "./test_openai_provider.mjs";
 import "./test_sol_context.mjs";
 import "./test_web_search_settings.mjs";
+import "./test_voice_delegation_settings.mjs";
 
 const root = mkdtempSync(join(tmpdir(), "vibes-sync-"));
 const write = (path, value) => {

@@ -84,6 +84,7 @@ save_templates() {
   previous="$(mktemp -d)"
   cp "$repo/settings.template.json" "$repo/subagent-config.template.json" "$repo/web-search.template.json" "$previous/"
   [ ! -f "$repo/models.template.json" ] || cp "$repo/models.template.json" "$previous/"
+  [ ! -f "$repo/pi-gippity-control.template.json" ] || cp "$repo/pi-gippity-control.template.json" "$previous/"
 }
 packages() {
   (cd "$repo" && npm ci --omit=dev --ignore-scripts && npm install --no-save --omit=dev codex-computer-use-mcp@latest @tmustier/pi-session-hud@latest)

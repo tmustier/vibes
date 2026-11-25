@@ -249,6 +249,18 @@ assert.equal(fallback.other, 0, "local directory fallback covers the bundle");
 assert.ok((await start(whimsical, agentStuff({ extensions: ["extensions/notify.ts"] }), agentStuffInstall)).other > 0, "other entry");
 assert.equal((await start(whimsical, agentStuff({}), agentStuffInstall)).other, 0, "same entry");
 
+// A package that already includes the bundled one (Codex Conversion includes GipPity's voice) makes
+// it step aside when the user loads that package's extensions. It is their choice, not a duplicate:
+// no notice and no migration turn.
+const included = bundled(new URL("../extensions/whimsical.ts", import.meta.url).href, { package: "mitsupi", entry: "extensions/whimsical.ts", includedIn: ["voice-superset"] });
+const supersetInstall = () => install(path.join(agentDir, "npm", "node_modules", "voice-superset"), "voice-superset");
+const withSuperset = await start(included, { global: ["npm:voice-superset"] }, supersetInstall);
+assert.equal(withSuperset.other, 0, "including package loaded: the bundle steps aside");
+assert.deepEqual(await sessionStart(withSuperset, true), [], "including package: no duplicate notice");
+assert.deepEqual(withSuperset.messages, [], "including package: no migration turn");
+assert.ok((await start(included, { global: [{ source: "npm:voice-superset", extensions: [] }] }, supersetInstall)).other > 0, "including package without its extensions: the bundle loads");
+assert.ok((await start(included)).other > 0, "no including package: the bundle loads");
+
 // A personal copy that gains the entry in an update: after the next session start, /reload sees it.
 const agentStuffPlain = { global: ["git:github.com/mitsuhiko/agent-stuff"] };
 const mitsupiDir = path.join(agentDir, "git", "github.com", "mitsuhiko", "agent-stuff");
